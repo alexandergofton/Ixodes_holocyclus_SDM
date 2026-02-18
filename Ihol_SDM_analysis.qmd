@@ -1,0 +1,1272 @@
+
+
+# 3. Environmental Data Preparation
+
+```{r load-env-data}
+#| label: load-env-data
+
+# --- WorldClim bioclimatic variables ---
+wc_path <- file.path(data_dir, "climate_data", "climate", "wc2.1_2.5m")
+bio_files <- file.path(wc_path, paste0("wc2.1_2.5m_bio_", 1:19, ".tif"))
+bio_exists <- file.exists(bio_files)
+
+if (!all(bio_exists)) {
+  warning("Missing WorldClim files: ", paste(which(!bio_exists), collapse = ", "))
+}
+
+bioclim_all <- rast(bio_files[bio_exists])
+names(bioclim_all) <- paste0("bio", seq_len(sum(bio_exists)))
+
+# --- ENVIREM variables ---
+envirem_path <- file.path(data_dir, "climate_data", "climate", "envirem")
+envirem_files <- file.path(envirem_path, c(
+  "current_2-5arcmin_annualPET.tif",
+  "current_2-5arcmin_aridityIndexThornthwaite.tif",
+  "current_2-5arcmin_climaticMoistureIndex.tif"
+))
+envirem_vars <- rast(envirem_files)
+names(envirem_vars) <- c("pet_annual", "aridity_idx", "cmi_idx")
+
+# --- CHELSA VPD ---
+chelsa_path <- file.path(data_dir, "climate_data", "climate", "chelsa")
+vpd_files <- file.path(chelsa_path,
+  paste0("CHELSA_vpd_", sprintf("%02d", 1:12), "_1981-2010_V.2.1.tif"))
+vpd_stack <- rast(vpd_files)
+# CHELSA VPD is stored as Pa * 100; convert to hPa
+vpd_stack <- vpd_stack / 100
+vpd_annual <- mean(vpd_stack, na.rm = TRUE)
+names(vpd_annual) <- "vpd_annual"
+
+# Aggregate CHELSA from 30 arcsec to 2.5 arcmin (factor of 5)
+vpd_agg <- aggregate(vpd_annual, fact = 5, fun = "mean", na.rm = TRUE)
+
+cat("Loaded:", nlyr(bioclim_all), "WorldClim +",
+    nlyr(envirem_vars), "ENVIREM +", "1 CHELSA VPD layers\n")
+```
+
+## 3.1 Crop, Align, and Stack
+
+```{r align-env-data}
+#| label: align-env-data
+
+# Crop all layers to study extent
+bioclim_crop <- crop(bioclim_all, study_extent)
+
+# Resample ENVIREM and CHELSA VPD to match the WorldClim grid exactly
+envirem_crop <- crop(envirem_vars, study_extent)
+envirem_resamp <- resample(envirem_crop, bioclim_crop[[1]], method = "bilinear")
+
+vpd_crop <- crop(vpd_agg, study_extent)
+vpd_resamp <- resample(vpd_crop, bioclim_crop[[1]], method = "bilinear")
+
+# Mask to land (Australia) using country boundary
+aus_vect <- vect(aus)
+bioclim_crop <- mask(bioclim_crop, aus_vect)
+envirem_resamp <- mask(envirem_resamp, aus_vect)
+vpd_resamp <- mask(vpd_resamp, aus_vect)
+
+# Stack all environmental layers
+env_all <- c(bioclim_crop, envirem_resamp, vpd_resamp)
+
+cat("Combined environmental stack:", nlyr(env_all), "layers\n")
+cat("Resolution:", res(env_all)[1], "degrees (~",
+    round(res(env_all)[1] * 111, 1), "km)\n")
+cat("Layers:", paste(names(env_all), collapse = ", "), "\n")
+```
+
+# 4. Variable Selection
+
+We select variables based on ecological knowledge of *I. holocyclus* biology (Teo et al. 2021, 2024; Heath 1974) and remove multicollinear predictors.
+
+## 4.1 Candidate Variable Selection
+
+```{r candidate-vars}
+#| label: candidate-vars
+
+# Ecologically justified candidate variables
+# Rationale:
+# - bio1:  Annual mean temp (overall thermal suitability)
+# - bio5:  Max temp warmest month (heat stress; upper limit ~32-33°C)
+# - bio6:  Min temp coldest month (cold stress; lower limit ~8°C)
+# - bio12: Annual precipitation (moisture for off-host survival)
+# - bio15: Precipitation seasonality (moisture reliability)
+# - bio4:  Temperature seasonality (continental vs. coastal)
+# - vpd_annual: Vapour pressure deficit (desiccation risk; key in Teo et al. 2024)
+# - aridity_idx: Thornthwaite aridity (integrated moisture availability)
+# - cmi_idx: Climatic moisture index
+
+candidate_vars <- c("bio1", "bio4", "bio5", "bio6", "bio12", "bio15",
+                     "aridity_idx", "cmi_idx", "vpd_annual")
+
+env_candidates <- env_all[[candidate_vars]]
+
+cat("Candidate variables:", paste(candidate_vars, collapse = ", "), "\n")
+```
+
+## 4.2 Multicollinearity Check
+
+```{r multicollinearity}
+#| label: multicollinearity
+#| fig-width: 8
+#| fig-height: 8
+
+# Extract values at occurrence points for correlation analysis
+occ_pts <- vect(occ_thinned, geom = c("lon", "lat"), crs = "EPSG:4326")
+occ_env <- terra::extract(env_candidates, occ_pts)
+occ_env <- occ_env[complete.cases(occ_env), -1]  # remove ID, remove NAs
+
+# Correlation matrix
+cor_mat <- cor(occ_env, use = "pairwise.complete.obs")
+
+# Plot correlation matrix
+corrplot(cor_mat, method = "color", type = "lower",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.cex = 0.8,
+         title = "Pairwise correlations among candidate predictors",
+         mar = c(0, 0, 2, 0))
+
+# Identify highly correlated pairs (|r| > 0.7)
+high_cor <- which(abs(cor_mat) > 0.7 & upper.tri(cor_mat), arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("\nHighly correlated pairs (|r| > 0.7):\n")
+  for (i in seq_len(nrow(high_cor))) {
+    v1 <- rownames(cor_mat)[high_cor[i, 1]]
+    v2 <- colnames(cor_mat)[high_cor[i, 2]]
+    r <- cor_mat[high_cor[i, 1], high_cor[i, 2]]
+    cat(sprintf("  %s vs %s: r = %.2f\n", v1, v2, r))
+  }
+}
+```
+
+## 4.3 Variable Reduction
+
+```{r variable-reduction}
+#| label: variable-reduction
+
+# Decision rules for removing correlated variables:
+# If bio1 correlates with bio5 or bio6 -> keep bio5 and bio6 (more ecologically
+#   specific: heat/cold limits match known thresholds)
+# If bio12 correlates with cmi_idx or aridity_idx -> keep bio12 + one moisture index
+# If vpd_annual correlates with aridity_idx or cmi_idx -> keep vpd_annual
+#   (directly linked to tick desiccation)
+
+# Start with all candidates and iteratively remove
+vars_to_remove <- c()
+
+# Check each pair and apply removal rules
+# bio1 vs bio5/bio6: bio1 is a mean; bio5 and bio6 capture extremes -> remove bio1
+if (abs(cor_mat["bio1", "bio5"]) > 0.7 | abs(cor_mat["bio1", "bio6"]) > 0.7) {
+  vars_to_remove <- c(vars_to_remove, "bio1")
+  cat("Removing bio1: correlated with bio5/bio6; extremes more ecologically relevant\n")
+}
+
+# aridity_idx vs cmi_idx: these are both moisture indices -> keep cmi_idx
+if (abs(cor_mat["aridity_idx", "cmi_idx"]) > 0.7) {
+  vars_to_remove <- c(vars_to_remove, "aridity_idx")
+  cat("Removing aridity_idx: correlated with cmi_idx\n")
+}
+
+# vpd_annual vs cmi_idx: if correlated, keep vpd (more mechanistic for tick desiccation)
+if (abs(cor_mat["vpd_annual", "cmi_idx"]) > 0.7) {
+  vars_to_remove <- c(vars_to_remove, "cmi_idx")
+  cat("Removing cmi_idx: correlated with vpd_annual; VPD is more directly relevant\n")
+}
+
+# bio4 vs bio5 or bio6: if correlated, remove bio4
+if (abs(cor_mat["bio4", "bio5"]) > 0.7 | abs(cor_mat["bio4", "bio6"]) > 0.7) {
+  vars_to_remove <- c(vars_to_remove, "bio4")
+  cat("Removing bio4: correlated with temperature extremes\n")
+}
+
+# Apply removals
+final_vars <- setdiff(candidate_vars, vars_to_remove)
+
+# If we still have >7 variables or any remaining high correlations, do another pass
+env_final_vals <- occ_env[, final_vars]
+cor_final <- cor(env_final_vals, use = "pairwise.complete.obs")
+remaining_high <- which(abs(cor_final) > 0.7 & upper.tri(cor_final), arr.ind = TRUE)
+
+if (nrow(remaining_high) > 0) {
+  cat("\nRemaining correlated pairs after first pass:\n")
+  for (i in seq_len(nrow(remaining_high))) {
+    v1 <- rownames(cor_final)[remaining_high[i, 1]]
+    v2 <- colnames(cor_final)[remaining_high[i, 2]]
+    r <- cor_final[remaining_high[i, 1], remaining_high[i, 2]]
+    cat(sprintf("  %s vs %s: r = %.2f\n", v1, v2, r))
+    # Remove the less ecologically important one
+    # Priority: bio5 > bio6 > vpd_annual > bio12 > bio15 > bio4 > cmi_idx > aridity_idx
+    if (v2 %in% c("cmi_idx", "aridity_idx", "bio4", "bio15")) {
+      final_vars <- setdiff(final_vars, v2)
+      cat(sprintf("  -> Removing %s\n", v2))
+    } else if (v1 %in% c("cmi_idx", "aridity_idx", "bio4", "bio15")) {
+      final_vars <- setdiff(final_vars, v1)
+      cat(sprintf("  -> Removing %s\n", v1))
+    }
+  }
+}
+
+# Ensure we have at least 4 and at most 7 variables
+cat("\nFinal predictor set (", length(final_vars), "variables):",
+    paste(final_vars, collapse = ", "), "\n")
+
+# Subset environmental stack
+env_model <- env_all[[final_vars]]
+```
+
+## 4.4 VIF Check
+
+```{r vif-check}
+#| label: vif-check
+
+# Calculate VIF manually (terra-based approach)
+occ_env_final <- occ_env[, final_vars]
+occ_env_final <- occ_env_final[complete.cases(occ_env_final), ]
+
+# VIF calculation
+calc_vif <- function(df) {
+  vif_vals <- numeric(ncol(df))
+  names(vif_vals) <- names(df)
+  for (i in seq_along(names(df))) {
+    formula_str <- paste(names(df)[i], "~", paste(names(df)[-i], collapse = " + "))
+    model <- lm(as.formula(formula_str), data = df)
+    r2 <- summary(model)$r.squared
+    vif_vals[i] <- 1 / (1 - r2)
+  }
+  return(vif_vals)
+}
+
+vif_values <- calc_vif(occ_env_final)
+cat("VIF values:\n")
+print(round(vif_values, 2))
+
+# Remove any with VIF > 10 (iteratively)
+while (max(vif_values) > 10 & length(final_vars) > 3) {
+  worst <- names(which.max(vif_values))
+  cat("Removing", worst, "with VIF =", round(max(vif_values), 2), "\n")
+  final_vars <- setdiff(final_vars, worst)
+  occ_env_final <- occ_env_final[, final_vars]
+  vif_values <- calc_vif(occ_env_final)
+}
+
+cat("\nFinal variables after VIF screening (", length(final_vars), "):",
+    paste(final_vars, collapse = ", "), "\n")
+cat("VIF values:\n")
+print(round(vif_values, 2))
+
+# Update environmental stack
+env_model <- env_all[[final_vars]]
+```
+
+# 5. Background Point Generation
+
+We generate background points (pseudo-absences) for model fitting. These represent the available environmental conditions within the study area.
+
+```{r background-points}
+#| label: background-points
+
+# Generate random background points within the study area, on land
+n_bg <- 10000
+
+# Use the first environmental layer as a template (non-NA = land)
+land_mask <- !is.na(env_model[[1]])
+
+# Sample random cells from land
+bg_cells <- spatSample(land_mask, size = n_bg, method = "random",
+                       cells = TRUE, na.rm = TRUE)
+
+bg_coords <- xyFromCell(env_model, bg_cells$cell)
+bg_df <- as.data.frame(bg_coords)
+names(bg_df) <- c("lon", "lat")
+
+# Remove background points within 5 km of any occurrence point
+occ_sf_pts <- st_as_sf(occ_thinned, coords = c("lon", "lat"), crs = 4326)
+bg_sf_pts <- st_as_sf(bg_df, coords = c("lon", "lat"), crs = 4326)
+
+# Calculate minimum distance from each background point to nearest occurrence
+# Using a 5 km buffer (~0.045 degrees)
+min_dist <- st_distance(bg_sf_pts, occ_sf_pts)
+min_dist_km <- apply(min_dist, 1, min) / 1000  # Convert metres to km
+
+bg_df <- bg_df[min_dist_km > 5, ]
+cat("Background points after 5 km buffer:", nrow(bg_df), "\n")
+
+# Trim to target number if we have too many
+if (nrow(bg_df) > n_bg) {
+  bg_df <- bg_df[sample(nrow(bg_df), n_bg), ]
+}
+
+cat("Final background points:", nrow(bg_df), "\n")
+```
+
+## 5.1 Extract Environmental Values and Build Modelling Dataset
+
+```{r modelling-dataset}
+#| label: modelling-dataset
+
+# Extract environmental values at occurrence points
+occ_vect <- vect(occ_thinned, geom = c("lon", "lat"), crs = "EPSG:4326")
+occ_env_vals <- terra::extract(env_model, occ_vect)
+occ_env_vals <- data.frame(
+  presence = 1,
+  lon = occ_thinned$lon,
+  lat = occ_thinned$lat,
+  occ_env_vals[, -1]  # Remove ID column
+)
+
+# Extract at background points
+bg_vect <- vect(bg_df, geom = c("lon", "lat"), crs = "EPSG:4326")
+bg_env_vals <- terra::extract(env_model, bg_vect)
+bg_env_vals <- data.frame(
+  presence = 0,
+  lon = bg_df$lon,
+  lat = bg_df$lat,
+  bg_env_vals[, -1]
+)
+
+# Combine into single modelling dataset
+model_data <- rbind(occ_env_vals, bg_env_vals)
+model_data <- model_data[complete.cases(model_data), ]
+
+cat("Modelling dataset: ", sum(model_data$presence == 1), "presences +",
+    sum(model_data$presence == 0), "background =",
+    nrow(model_data), "total\n")
+```
+
+## 5.2 Map Presence and Background Points
+
+```{r map-points}
+#| label: map-points
+#| fig-width: 8
+#| fig-height: 8
+
+p_points <- ggplot() +
+  geom_sf(data = aus, fill = "grey90", colour = "grey40") +
+  geom_point(data = model_data %>% filter(presence == 0),
+             aes(x = lon, y = lat),
+             colour = "steelblue", size = 0.3, alpha = 0.2) +
+  geom_point(data = model_data %>% filter(presence == 1),
+             aes(x = lon, y = lat),
+             colour = "red", size = 1.5, alpha = 0.7) +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  labs(
+    title = "Modelling dataset",
+    subtitle = paste0("Red: presences (n=", sum(model_data$presence == 1),
+                      "), Blue: background (n=", sum(model_data$presence == 0), ")"),
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+
+print(p_points)
+```
+
+# 6. Spatial Cross-Validation Setup
+
+We use spatially-blocked cross-validation to avoid inflated accuracy metrics caused by spatial autocorrelation.
+
+```{r spatial-cv}
+#| label: spatial-cv
+
+# Convert modelling data to sf
+model_sf <- st_as_sf(model_data, coords = c("lon", "lat"), crs = 4326)
+
+# Create spatial blocks for cross-validation
+# Block size should approximate the spatial autocorrelation range
+# For tick distributions at this scale, ~200 km is reasonable
+sb <- cv_spatial(
+  x = model_sf,
+  column = "presence",
+  k = 5,
+  size = 200000,  # 200 km in metres
+  selection = "random",
+  iteration = 100,
+  progress = FALSE
+)
+
+cat("Spatial CV folds created:\n")
+for (i in 1:5) {
+  n_train_pres <- sum(model_data$presence[sb$folds_list[[i]][[1]]] == 1)
+  n_train_bg <- sum(model_data$presence[sb$folds_list[[i]][[1]]] == 0)
+  n_test_pres <- sum(model_data$presence[sb$folds_list[[i]][[2]]] == 1)
+  n_test_bg <- sum(model_data$presence[sb$folds_list[[i]][[2]]] == 0)
+  cat(sprintf("  Fold %d: Train %d pres + %d bg | Test %d pres + %d bg\n",
+              i, n_train_pres, n_train_bg, n_test_pres, n_test_bg))
+}
+```
+
+# 7. Model Fitting and Evaluation
+
+## 7.1 Helper Functions
+
+```{r helper-functions}
+#| label: helper-functions
+
+# Function to calculate AUC
+calc_auc <- function(obs, pred) {
+  # obs: 0/1 vector, pred: predicted probabilities
+  n1 <- sum(obs == 1)
+  n0 <- sum(obs == 0)
+  if (n1 == 0 | n0 == 0) return(NA)
+
+  ranks <- rank(pred)
+  auc <- (sum(ranks[obs == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  return(auc)
+}
+
+# Function to calculate TSS (at threshold maximising TSS)
+calc_tss <- function(obs, pred, n_thresholds = 100) {
+  thresholds <- seq(min(pred), max(pred), length.out = n_thresholds)
+  tss_vals <- sapply(thresholds, function(t) {
+    pred_bin <- ifelse(pred >= t, 1, 0)
+    tp <- sum(pred_bin == 1 & obs == 1)
+    fn <- sum(pred_bin == 0 & obs == 1)
+    fp <- sum(pred_bin == 1 & obs == 0)
+    tn <- sum(pred_bin == 0 & obs == 0)
+    sensitivity <- tp / (tp + fn)
+    specificity <- tn / (tn + fp)
+    tss <- sensitivity + specificity - 1
+    return(tss)
+  })
+  best_idx <- which.max(tss_vals)
+  return(list(tss = tss_vals[best_idx], threshold = thresholds[best_idx]))
+}
+
+# Function to calculate Boyce Index
+calc_boyce <- function(obs, pred) {
+  tryCatch({
+    bi <- ecospat.boyce(fit = pred, obs = pred[obs == 1],
+                        nclass = 0, window.w = "default", res = 100,
+                        PEplot = FALSE)
+    return(bi$cor)
+  }, error = function(e) return(NA))
+}
+```
+
+## 7.2 Cross-Validated Model Fitting
+
+```{r cv-model-fitting}
+#| label: cv-model-fitting
+#| cache: true
+
+# Prepare storage for CV results
+cv_results <- list()
+
+# Predictor columns
+pred_cols <- final_vars
+
+for (fold_i in 1:5) {
+
+  cat("\n=== Fold", fold_i, "===\n")
+
+  train_idx <- sb$folds_list[[fold_i]][[1]]
+  test_idx <- sb$folds_list[[fold_i]][[2]]
+
+  train_data <- model_data[train_idx, ]
+  test_data <- model_data[test_idx, ]
+
+  train_x <- as.data.frame(train_data[, pred_cols])
+  test_x <- as.data.frame(test_data[, pred_cols])
+  train_y <- train_data$presence
+  test_y <- test_data$presence
+
+  fold_results <- list()
+
+  # --- 1. MaxEnt ---
+  tryCatch({
+    me_model <- maxnet(p = train_y, data = train_x,
+                       maxnet.formula(p = train_y, data = train_x,
+                                      classes = "lqh"))
+    me_pred <- predict(me_model, test_x, type = "cloglog")
+    fold_results$maxent <- list(
+      auc = calc_auc(test_y, me_pred),
+      tss = calc_tss(test_y, me_pred)$tss,
+      boyce = calc_boyce(test_y, me_pred)
+    )
+    cat("  MaxEnt AUC:", round(fold_results$maxent$auc, 3), "\n")
+  }, error = function(e) {
+    cat("  MaxEnt failed:", e$message, "\n")
+    fold_results$maxent <<- list(auc = NA, tss = NA, boyce = NA)
+  })
+
+  # --- 2. Random Forest ---
+  tryCatch({
+    rf_data <- cbind(presence = factor(train_y), train_x)
+    rf_model <- randomForest(presence ~ ., data = rf_data,
+                             ntree = 1000,
+                             mtry = floor(sqrt(length(pred_cols))))
+    rf_pred <- predict(rf_model, test_x, type = "prob")[, "1"]
+    fold_results$rf <- list(
+      auc = calc_auc(test_y, rf_pred),
+      tss = calc_tss(test_y, rf_pred)$tss,
+      boyce = calc_boyce(test_y, rf_pred)
+    )
+    cat("  Random Forest AUC:", round(fold_results$rf$auc, 3), "\n")
+  }, error = function(e) {
+    cat("  RF failed:", e$message, "\n")
+    fold_results$rf <<- list(auc = NA, tss = NA, boyce = NA)
+  })
+
+  # --- 3. BRT (Boosted Regression Trees) ---
+  tryCatch({
+    brt_data <- cbind(presence = train_y, train_x)
+    brt_model <- gbm.step(
+      data = brt_data,
+      gbm.x = which(names(brt_data) %in% pred_cols),
+      gbm.y = 1,
+      family = "bernoulli",
+      tree.complexity = 3,
+      learning.rate = 0.005,
+      bag.fraction = 0.75,
+      silent = TRUE,
+      plot.main = FALSE
+    )
+
+    if (!is.null(brt_model)) {
+      brt_pred <- predict(brt_model, test_x,
+                          n.trees = brt_model$gbm.call$best.trees,
+                          type = "response")
+      fold_results$brt <- list(
+        auc = calc_auc(test_y, brt_pred),
+        tss = calc_tss(test_y, brt_pred)$tss,
+        boyce = calc_boyce(test_y, brt_pred)
+      )
+      cat("  BRT AUC:", round(fold_results$brt$auc, 3), "\n")
+    } else {
+      # Try with lower learning rate
+      brt_model <- gbm.step(
+        data = brt_data,
+        gbm.x = which(names(brt_data) %in% pred_cols),
+        gbm.y = 1,
+        family = "bernoulli",
+        tree.complexity = 2,
+        learning.rate = 0.001,
+        bag.fraction = 0.75,
+        silent = TRUE,
+        plot.main = FALSE
+      )
+      if (!is.null(brt_model)) {
+        brt_pred <- predict(brt_model, test_x,
+                            n.trees = brt_model$gbm.call$best.trees,
+                            type = "response")
+        fold_results$brt <- list(
+          auc = calc_auc(test_y, brt_pred),
+          tss = calc_tss(test_y, brt_pred)$tss,
+          boyce = calc_boyce(test_y, brt_pred)
+        )
+        cat("  BRT AUC:", round(fold_results$brt$auc, 3), "\n")
+      } else {
+        fold_results$brt <- list(auc = NA, tss = NA, boyce = NA)
+        cat("  BRT: could not fit model\n")
+      }
+    }
+  }, error = function(e) {
+    cat("  BRT failed:", e$message, "\n")
+    fold_results$brt <<- list(auc = NA, tss = NA, boyce = NA)
+  })
+
+  # --- 4. GAM ---
+  tryCatch({
+    gam_data <- cbind(presence = train_y, train_x)
+    # Build formula with smooth terms
+    smooth_terms <- paste0("s(", pred_cols, ", k = 5)")
+    gam_formula <- as.formula(
+      paste("presence ~", paste(smooth_terms, collapse = " + "))
+    )
+    gam_model <- gam(gam_formula, data = gam_data,
+                     family = binomial(link = "logit"),
+                     method = "REML")
+    gam_pred <- predict(gam_model, test_x, type = "response")
+    fold_results$gam <- list(
+      auc = calc_auc(test_y, gam_pred),
+      tss = calc_tss(test_y, gam_pred)$tss,
+      boyce = calc_boyce(test_y, gam_pred)
+    )
+    cat("  GAM AUC:", round(fold_results$gam$auc, 3), "\n")
+  }, error = function(e) {
+    cat("  GAM failed:", e$message, "\n")
+    fold_results$gam <<- list(auc = NA, tss = NA, boyce = NA)
+  })
+
+  # --- 5. GLM ---
+  tryCatch({
+    glm_data <- cbind(presence = train_y, train_x)
+    # Linear + quadratic terms for temperature, linear for others
+    temp_vars <- pred_cols[grepl("bio5|bio6", pred_cols)]
+    other_vars <- setdiff(pred_cols, temp_vars)
+    glm_terms <- c(
+      other_vars,
+      paste0("poly(", temp_vars, ", 2)")
+    )
+    glm_formula <- as.formula(
+      paste("presence ~", paste(glm_terms, collapse = " + "))
+    )
+    glm_model <- glm(glm_formula, data = glm_data,
+                     family = binomial(link = "logit"))
+    glm_pred <- predict(glm_model, test_x, type = "response")
+    fold_results$glm <- list(
+      auc = calc_auc(test_y, glm_pred),
+      tss = calc_tss(test_y, glm_pred)$tss,
+      boyce = calc_boyce(test_y, glm_pred)
+    )
+    cat("  GLM AUC:", round(fold_results$glm$auc, 3), "\n")
+  }, error = function(e) {
+    cat("  GLM failed:", e$message, "\n")
+    fold_results$glm <<- list(auc = NA, tss = NA, boyce = NA)
+  })
+
+  cv_results[[fold_i]] <- fold_results
+}
+```
+
+## 7.3 Cross-Validation Summary
+
+```{r cv-summary}
+#| label: cv-summary
+
+# Compile CV results into a data frame
+algorithms <- c("maxent", "rf", "brt", "gam", "glm")
+algo_names <- c("MaxEnt", "Random Forest", "BRT", "GAM", "GLM")
+
+cv_summary <- data.frame(
+  Algorithm = algo_names,
+  AUC_mean = NA, AUC_sd = NA,
+  TSS_mean = NA, TSS_sd = NA,
+  Boyce_mean = NA, Boyce_sd = NA
+)
+
+for (i in seq_along(algorithms)) {
+  alg <- algorithms[i]
+  auc_vals <- sapply(cv_results, function(f) f[[alg]]$auc)
+  tss_vals <- sapply(cv_results, function(f) f[[alg]]$tss)
+  boyce_vals <- sapply(cv_results, function(f) f[[alg]]$boyce)
+
+  cv_summary$AUC_mean[i] <- round(mean(auc_vals, na.rm = TRUE), 3)
+  cv_summary$AUC_sd[i] <- round(sd(auc_vals, na.rm = TRUE), 3)
+  cv_summary$TSS_mean[i] <- round(mean(tss_vals, na.rm = TRUE), 3)
+  cv_summary$TSS_sd[i] <- round(sd(tss_vals, na.rm = TRUE), 3)
+  cv_summary$Boyce_mean[i] <- round(mean(boyce_vals, na.rm = TRUE), 3)
+  cv_summary$Boyce_sd[i] <- round(sd(boyce_vals, na.rm = TRUE), 3)
+}
+
+cat("\n========================================\n")
+cat("SPATIAL CROSS-VALIDATION RESULTS (5-fold)\n")
+cat("========================================\n\n")
+print(cv_summary, row.names = FALSE)
+
+# Save CV summary
+write_csv(cv_summary, file.path(output_dir, "cv_performance_summary.csv"))
+```
+
+# 8. Full Model Fitting (All Data)
+
+Now we refit each algorithm on the complete dataset for final predictions.
+
+```{r full-model-fitting}
+#| label: full-model-fitting
+#| cache: true
+
+all_x <- as.data.frame(model_data[, pred_cols])
+all_y <- model_data$presence
+
+full_models <- list()
+
+# --- 1. MaxEnt ---
+cat("Fitting MaxEnt on full data...\n")
+full_models$maxent <- maxnet(p = all_y, data = all_x,
+                             maxnet.formula(p = all_y, data = all_x,
+                                            classes = "lqh"))
+
+# --- 2. Random Forest ---
+cat("Fitting Random Forest on full data...\n")
+rf_full_data <- cbind(presence = factor(all_y), all_x)
+full_models$rf <- randomForest(presence ~ ., data = rf_full_data,
+                               ntree = 1000,
+                               mtry = floor(sqrt(length(pred_cols))),
+                               importance = TRUE)
+
+# --- 3. BRT ---
+cat("Fitting BRT on full data...\n")
+brt_full_data <- cbind(presence = all_y, all_x)
+full_models$brt <- gbm.step(
+  data = brt_full_data,
+  gbm.x = which(names(brt_full_data) %in% pred_cols),
+  gbm.y = 1,
+  family = "bernoulli",
+  tree.complexity = 3,
+  learning.rate = 0.005,
+  bag.fraction = 0.75,
+  silent = TRUE,
+  plot.main = FALSE
+)
+
+# If BRT fails with these settings, try lower learning rate
+if (is.null(full_models$brt)) {
+  full_models$brt <- gbm.step(
+    data = brt_full_data,
+    gbm.x = which(names(brt_full_data) %in% pred_cols),
+    gbm.y = 1,
+    family = "bernoulli",
+    tree.complexity = 2,
+    learning.rate = 0.001,
+    bag.fraction = 0.75,
+    silent = TRUE,
+    plot.main = FALSE
+  )
+}
+
+# --- 4. GAM ---
+cat("Fitting GAM on full data...\n")
+gam_full_data <- cbind(presence = all_y, all_x)
+smooth_terms <- paste0("s(", pred_cols, ", k = 5)")
+gam_formula <- as.formula(
+  paste("presence ~", paste(smooth_terms, collapse = " + "))
+)
+full_models$gam <- gam(gam_formula, data = gam_full_data,
+                       family = binomial(link = "logit"),
+                       method = "REML")
+
+# --- 5. GLM ---
+cat("Fitting GLM on full data...\n")
+glm_full_data <- cbind(presence = all_y, all_x)
+temp_vars <- pred_cols[grepl("bio5|bio6", pred_cols)]
+other_vars <- setdiff(pred_cols, temp_vars)
+glm_terms <- c(other_vars, paste0("poly(", temp_vars, ", 2)"))
+glm_formula <- as.formula(
+  paste("presence ~", paste(glm_terms, collapse = " + "))
+)
+full_models$glm <- glm(glm_formula, data = glm_full_data,
+                       family = binomial(link = "logit"))
+
+cat("All models fitted successfully.\n")
+```
+
+## 8.1 Variable Importance
+
+```{r variable-importance}
+#| label: variable-importance
+#| fig-width: 10
+#| fig-height: 6
+
+# MaxEnt variable importance (from model coefficients)
+# Use permutation-based importance where available
+
+# Random Forest importance
+rf_imp <- importance(full_models$rf, type = 2)
+rf_imp_df <- data.frame(
+  Variable = rownames(rf_imp),
+  Importance = rf_imp[, 1],
+  Algorithm = "Random Forest"
+)
+rf_imp_df$Importance <- rf_imp_df$Importance / max(rf_imp_df$Importance) * 100
+
+# BRT importance
+if (!is.null(full_models$brt)) {
+  brt_imp <- summary(full_models$brt, plotit = FALSE)
+  brt_imp_df <- data.frame(
+    Variable = brt_imp$var,
+    Importance = brt_imp$rel.inf,
+    Algorithm = "BRT"
+  )
+}
+
+# Combine
+var_imp_all <- bind_rows(rf_imp_df, brt_imp_df)
+
+p_varimp <- ggplot(var_imp_all, aes(x = reorder(Variable, Importance),
+                                     y = Importance, fill = Algorithm)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Variable importance across algorithms",
+       x = "", y = "Relative importance (%)") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+print(p_varimp)
+
+ggsave(file.path(figures_dir, "02_variable_importance.png"), p_varimp,
+       width = 10, height = 6, dpi = 300)
+```
+
+## 8.2 Response Curves
+
+```{r response-curves}
+#| label: response-curves
+#| fig-width: 12
+#| fig-height: 8
+
+# Generate response curves from GAM (smoothest, most interpretable)
+# For each variable, predict across its range while holding others at median
+
+response_plots <- list()
+
+for (var in pred_cols) {
+  # Create prediction data: vary focal variable, hold others at median
+  var_range <- seq(
+    min(all_x[[var]], na.rm = TRUE),
+    max(all_x[[var]], na.rm = TRUE),
+    length.out = 200
+  )
+
+  pred_data <- as.data.frame(
+    matrix(rep(colMeans(all_x, na.rm = TRUE), each = 200),
+           nrow = 200, dimnames = list(NULL, pred_cols))
+  )
+  pred_data[[var]] <- var_range
+
+  # Predict from GAM
+  gam_response <- predict(full_models$gam, pred_data, type = "response")
+
+  response_df <- data.frame(x = var_range, y = gam_response)
+
+  # Mark the observed range at occurrence points
+  occ_subset <- occ_env_vals[occ_env_vals[["presence"]] == 1, ]
+  occ_range <- range(occ_subset[[var]], na.rm = TRUE)
+
+  response_plots[[var]] <- ggplot(response_df, aes(x = x, y = y)) +
+    geom_line(colour = "darkblue", linewidth = 1) +
+    geom_vline(xintercept = occ_range, linetype = "dashed", colour = "red",
+               alpha = 0.5) +
+    labs(title = var, x = var, y = "Predicted suitability") +
+    ylim(0, 1) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10))
+}
+
+p_response <- wrap_plots(response_plots, ncol = 3) +
+  plot_annotation(
+    title = "GAM response curves",
+    subtitle = "Red dashed lines = observed range at occurrence points"
+  )
+
+print(p_response)
+
+ggsave(file.path(figures_dir, "03_response_curves.png"), p_response,
+       width = 12, height = 8, dpi = 300)
+```
+
+# 9. Ensemble Prediction
+
+```{r ensemble-prediction}
+#| label: ensemble-prediction
+#| cache: true
+
+# Predict habitat suitability from each model across the study area
+# We extract all raster values as a data frame, predict in R, then write back
+# to raster. This avoids compatibility issues with terra::predict() for
+# different model types.
+
+cat("Extracting raster values for prediction...\n")
+
+# Get all cell values as a data frame
+env_df <- as.data.frame(env_model, xy = TRUE, cells = TRUE, na.rm = TRUE)
+pred_df <- env_df[, final_vars]  # Just the predictor columns
+
+# --- MaxEnt ---
+cat("  Predicting MaxEnt...\n")
+me_pred_vals <- predict(full_models$maxent, pred_df, type = "cloglog")
+pred_maxent <- env_model[[1]]
+pred_maxent[] <- NA
+pred_maxent[env_df$cell] <- me_pred_vals
+names(pred_maxent) <- "maxent"
+
+# --- Random Forest ---
+cat("  Predicting Random Forest...\n")
+rf_pred_vals <- predict(full_models$rf, pred_df, type = "prob")[, "1"]
+pred_rf <- env_model[[1]]
+pred_rf[] <- NA
+pred_rf[env_df$cell] <- rf_pred_vals
+names(pred_rf) <- "rf"
+
+# --- BRT ---
+cat("  Predicting BRT...\n")
+if (!is.null(full_models$brt)) {
+  brt_pred_vals <- predict(full_models$brt, pred_df,
+                           n.trees = full_models$brt$gbm.call$best.trees,
+                           type = "response")
+  pred_brt <- env_model[[1]]
+  pred_brt[] <- NA
+  pred_brt[env_df$cell] <- brt_pred_vals
+  names(pred_brt) <- "brt"
+} else {
+  # Fallback: use mean of other models if BRT failed
+  cat("  WARNING: BRT model was NULL; using placeholder\n")
+  pred_brt <- NULL
+}
+
+# --- GAM ---
+cat("  Predicting GAM...\n")
+gam_pred_vals <- predict(full_models$gam, pred_df, type = "response")
+pred_gam <- env_model[[1]]
+pred_gam[] <- NA
+pred_gam[env_df$cell] <- gam_pred_vals
+names(pred_gam) <- "gam"
+
+# --- GLM ---
+cat("  Predicting GLM...\n")
+glm_pred_vals <- predict(full_models$glm, pred_df, type = "response")
+pred_glm <- env_model[[1]]
+pred_glm[] <- NA
+pred_glm[env_df$cell] <- glm_pred_vals
+names(pred_glm) <- "glm"
+
+cat("Individual model predictions generated.\n")
+```
+
+## 9.1 AUC-Weighted Ensemble
+
+```{r ensemble-weights}
+#| label: ensemble-weights
+
+# Calculate AUC-based weights from cross-validation
+weights <- cv_summary$AUC_mean
+names(weights) <- algorithms
+
+# Normalise weights to sum to 1
+weights <- weights / sum(weights, na.rm = TRUE)
+
+# Handle any NAs (set weight to 0)
+weights[is.na(weights)] <- 0
+
+cat("Ensemble weights (proportional to CV AUC):\n")
+for (i in seq_along(algo_names)) {
+  cat(sprintf("  %s: %.3f (AUC = %.3f)\n",
+              algo_names[i], weights[i], cv_summary$AUC_mean[i]))
+}
+
+# Build list of available predictions and corresponding weights
+pred_list <- list(maxent = pred_maxent, rf = pred_rf, gam = pred_gam, glm = pred_glm)
+weight_list <- weights[c("maxent", "rf", "gam", "glm")]
+
+if (!is.null(pred_brt)) {
+  pred_list$brt <- pred_brt
+  weight_list <- c(weight_list, weights["brt"])
+}
+
+# Renormalise weights to available models
+weight_list <- weight_list / sum(weight_list, na.rm = TRUE)
+
+# Compute weighted ensemble
+ensemble_mean <- pred_list[[1]] * 0  # Initialise to zero raster
+for (nm in names(pred_list)) {
+  ensemble_mean <- ensemble_mean + pred_list[[nm]] * weight_list[nm]
+}
+names(ensemble_mean) <- "ensemble_suitability"
+
+# Prediction uncertainty (SD across models)
+pred_stack <- rast(pred_list)
+ensemble_sd <- app(pred_stack, fun = "sd", na.rm = TRUE)
+names(ensemble_sd) <- "ensemble_uncertainty"
+
+cat("Ensemble prediction generated.\n")
+cat("Suitability range:", round(global(ensemble_mean, "min", na.rm = TRUE)[[1]], 3),
+    "to", round(global(ensemble_mean, "max", na.rm = TRUE)[[1]], 3), "\n")
+```
+
+## 9.2 Binary Threshold Map
+
+```{r binary-map}
+#| label: binary-map
+
+# Find the threshold that maximises TSS on the full training data
+full_pred_at_points <- terra::extract(ensemble_mean, occ_vect)$ensemble_suitability
+full_pred_at_bg <- terra::extract(ensemble_mean, bg_vect)$ensemble_suitability
+
+full_preds <- c(full_pred_at_points, full_pred_at_bg)
+full_obs <- c(rep(1, length(full_pred_at_points)), rep(0, length(full_pred_at_bg)))
+
+# Remove NAs
+valid <- complete.cases(full_preds, full_obs)
+tss_result <- calc_tss(full_obs[valid], full_preds[valid])
+
+cat("Optimal TSS threshold:", round(tss_result$threshold, 3), "\n")
+cat("TSS at threshold:", round(tss_result$tss, 3), "\n")
+
+# Create binary map
+ensemble_binary <- ensemble_mean >= tss_result$threshold
+names(ensemble_binary) <- "predicted_presence"
+
+# Calculate area of suitable habitat
+# cellSize with unit="km" returns area in km²
+cell_areas <- cellSize(ensemble_binary, unit = "km")
+suitable_area <- global(ensemble_binary * cell_areas, "sum", na.rm = TRUE)[[1]]
+cat("Predicted suitable area:", format(round(suitable_area), big.mark = ","), "km²\n")
+```
+
+# 10. Visualisation and Output
+
+## 10.1 Ensemble Suitability Map
+
+```{r map-ensemble}
+#| label: map-ensemble
+#| fig-width: 10
+#| fig-height: 10
+
+# Convert rasters to data frames for ggplot
+ensemble_df <- as.data.frame(ensemble_mean, xy = TRUE, na.rm = TRUE)
+names(ensemble_df) <- c("x", "y", "suitability")
+
+p_ensemble <- ggplot() +
+  geom_raster(data = ensemble_df, aes(x = x, y = y, fill = suitability)) +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
+  geom_point(data = occ_thinned, aes(x = lon, y = lat),
+             colour = "red", size = 0.8, alpha = 0.5, shape = 16) +
+  scale_fill_viridis(option = "magma", direction = -1,
+                     name = "Habitat\nSuitability",
+                     limits = c(0, 1)) +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  labs(
+    title = expression("Ensemble habitat suitability for" ~ italic("Ixodes holocyclus")),
+    subtitle = "AUC-weighted mean of MaxEnt, RF, BRT, GAM, GLM",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p_ensemble)
+
+ggsave(file.path(figures_dir, "04_ensemble_suitability.png"), p_ensemble,
+       width = 10, height = 10, dpi = 300)
+```
+
+## 10.2 Binary Presence Map
+
+```{r map-binary}
+#| label: map-binary
+#| fig-width: 10
+#| fig-height: 10
+
+binary_df <- as.data.frame(ensemble_binary, xy = TRUE, na.rm = TRUE)
+names(binary_df) <- c("x", "y", "presence")
+binary_df$presence <- factor(binary_df$presence,
+                             levels = c(0, 1),
+                             labels = c("Unsuitable", "Suitable"))
+
+p_binary <- ggplot() +
+  geom_raster(data = binary_df,
+              aes(x = x, y = y, fill = presence)) +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
+  geom_point(data = occ_thinned, aes(x = lon, y = lat),
+             colour = "red", size = 0.8, alpha = 0.5, shape = 16) +
+  scale_fill_manual(values = c("Unsuitable" = "grey85", "Suitable" = "darkgreen"),
+                    name = "") +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  labs(
+    title = expression("Predicted distribution of" ~ italic("Ixodes holocyclus")),
+    subtitle = paste0("TSS-optimised threshold = ", round(tss_result$threshold, 3),
+                      " | Red dots = occurrence records"),
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p_binary)
+
+ggsave(file.path(figures_dir, "05_binary_distribution.png"), p_binary,
+       width = 10, height = 10, dpi = 300)
+```
+
+## 10.3 Prediction Uncertainty Map
+
+```{r map-uncertainty}
+#| label: map-uncertainty
+#| fig-width: 10
+#| fig-height: 10
+
+uncert_df <- as.data.frame(ensemble_sd, xy = TRUE, na.rm = TRUE)
+names(uncert_df) <- c("x", "y", "uncertainty")
+
+p_uncert <- ggplot() +
+  geom_raster(data = uncert_df,
+              aes(x = x, y = y, fill = uncertainty)) +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
+  scale_fill_viridis(option = "plasma", name = "SD across\nmodels") +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  labs(
+    title = "Prediction uncertainty",
+    subtitle = "Standard deviation across 5 SDM algorithms",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p_uncert)
+
+ggsave(file.path(figures_dir, "06_prediction_uncertainty.png"), p_uncert,
+       width = 10, height = 10, dpi = 300)
+```
+
+## 10.4 Individual Model Comparison
+
+```{r map-individual-models}
+#| label: map-individual-models
+#| fig-width: 14
+#| fig-height: 10
+
+# Convert each model prediction to data frame
+make_pred_df <- function(rast, name) {
+  df <- as.data.frame(rast, xy = TRUE, na.rm = TRUE)
+  names(df) <- c("x", "y", "suitability")
+  df$model <- name
+  return(df)
+}
+
+pred_dfs <- list(
+  make_pred_df(pred_maxent, "MaxEnt"),
+  make_pred_df(pred_rf, "Random Forest"),
+  make_pred_df(pred_gam, "GAM"),
+  make_pred_df(pred_glm, "GLM"),
+  make_pred_df(ensemble_mean, "Ensemble")
+)
+if (!is.null(pred_brt)) {
+  pred_dfs <- c(pred_dfs, list(make_pred_df(pred_brt, "BRT")))
+}
+all_pred_df <- bind_rows(pred_dfs)
+
+p_compare <- ggplot() +
+  geom_raster(data = all_pred_df,
+              aes(x = x, y = y, fill = suitability)) +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.2) +
+  scale_fill_viridis(option = "magma", direction = -1,
+                     name = "Suitability", limits = c(0, 1)) +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  facet_wrap(~model, ncol = 3) +
+  labs(
+    title = expression("Individual model predictions for" ~ italic("Ixodes holocyclus")),
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(size = 12, face = "bold"))
+
+print(p_compare)
+
+ggsave(file.path(figures_dir, "07_model_comparison.png"), p_compare,
+       width = 14, height = 10, dpi = 300)
+```
+
+## 10.5 Save GeoTIFF Outputs
+
+```{r save-outputs}
+#| label: save-outputs
+
+sdm_output_dir <- file.path(output_dir, "sdm_results")
+dir.create(sdm_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save ensemble outputs
+writeRaster(ensemble_mean,
+            file.path(sdm_output_dir, "ensemble_suitability.tif"),
+            overwrite = TRUE)
+writeRaster(ensemble_sd,
+            file.path(sdm_output_dir, "ensemble_uncertainty.tif"),
+            overwrite = TRUE)
+writeRaster(ensemble_binary,
+            file.path(sdm_output_dir, "ensemble_binary.tif"),
+            overwrite = TRUE)
+
+# Save individual model predictions
+writeRaster(pred_maxent,
+            file.path(sdm_output_dir, "pred_maxent.tif"),
+            overwrite = TRUE)
+writeRaster(pred_rf,
+            file.path(sdm_output_dir, "pred_rf.tif"),
+            overwrite = TRUE)
+if (!is.null(pred_brt)) {
+  writeRaster(pred_brt,
+              file.path(sdm_output_dir, "pred_brt.tif"),
+              overwrite = TRUE)
+}
+writeRaster(pred_gam,
+            file.path(sdm_output_dir, "pred_gam.tif"),
+            overwrite = TRUE)
+writeRaster(pred_glm,
+            file.path(sdm_output_dir, "pred_glm.tif"),
+            overwrite = TRUE)
+
+cat("All GeoTIFF outputs saved to:", sdm_output_dir, "\n")
+```
+
+# 11. Ecological Validation
+
+```{r ecological-validation}
+#| label: ecological-validation
+
+# --- Check against known physiological thresholds ---
+
+# Extract environmental values at predicted suitable locations
+suitable_cells <- as.data.frame(ensemble_binary, xy = TRUE, na.rm = TRUE)
+suitable_cells <- suitable_cells[suitable_cells[[3]] == 1, ]
+suitable_vect <- vect(suitable_cells[, 1:2], geom = c("x", "y"), crs = "EPSG:4326")
+suitable_env <- terra::extract(env_all, suitable_vect)
+
+cat("=== Ecological Validation ===\n\n")
+
+# Temperature checks (from Heath 1974, Teo et al. 2021)
+if ("bio5" %in% names(suitable_env)) {
+  bio5_range <- range(suitable_env$bio5, na.rm = TRUE)
+  cat(sprintf("Max temp warmest month (bio5) in suitable area: %.1f - %.1f °C\n",
+              bio5_range[1], bio5_range[2]))
+  cat(sprintf("  Expected upper limit: ~32-33°C (Heat stress threshold)\n"))
+  cat(sprintf("  Check: %s\n\n",
+              ifelse(bio5_range[2] <= 35, "PASS", "WARNING - exceeds expected limit")))
+}
+
+if ("bio6" %in% names(suitable_env)) {
+  bio6_range <- range(suitable_env$bio6, na.rm = TRUE)
+  cat(sprintf("Min temp coldest month (bio6) in suitable area: %.1f - %.1f °C\n",
+              bio6_range[1], bio6_range[2]))
+  cat(sprintf("  Expected lower limit: ~8°C (Developmental threshold)\n"))
+  cat(sprintf("  Check: %s\n\n",
+              ifelse(bio6_range[1] >= -2, "PASS - within reasonable range",
+                     "WARNING - well below expected limit")))
+}
+
+if ("bio12" %in% names(suitable_env)) {
+  bio12_range <- range(suitable_env$bio12, na.rm = TRUE)
+  cat(sprintf("Annual precipitation (bio12) in suitable area: %.0f - %.0f mm\n",
+              bio12_range[1], bio12_range[2]))
+  cat(sprintf("  Expected: >500 mm (moisture requirement for off-host survival)\n\n"))
+}
+
+# --- Geographic range check ---
+cat("Geographic extent of predicted suitable habitat:\n")
+cat(sprintf("  Latitude: %.1f to %.1f S\n",
+            abs(max(suitable_cells$y)), abs(min(suitable_cells$y))))
+cat(sprintf("  Longitude: %.1f to %.1f E\n",
+            min(suitable_cells$x), max(suitable_cells$x)))
+cat("\n")
+cat("Expected range (Teo et al. 2021):\n")
+cat("  Coastal fringe from north QLD (~15°S) to eastern VIC (~38°S)\n")
+cat("  Predominantly east of the Great Dividing Range\n")
+```
+
+## 11.1 Cross-Validation Performance Summary
+
+```{r final-summary}
+#| label: final-summary
+
+cat("\n")
+cat("===================================================\n")
+cat("  FINAL MODEL PERFORMANCE SUMMARY\n")
+cat("===================================================\n\n")
+
+print(cv_summary, row.names = FALSE)
+
+cat("\n")
+cat("Ensemble weights:\n")
+for (i in seq_along(algo_names)) {
+  cat(sprintf("  %15s: %.3f\n", algo_names[i], weights[i]))
+}
+cat(sprintf("\nTSS threshold for binary map: %.3f\n", tss_result$threshold))
+cat(sprintf("Number of occurrence records used: %d\n", sum(model_data$presence == 1)))
+cat(sprintf("Number of background points used: %d\n", sum(model_data$presence == 0)))
+cat(sprintf("Number of environmental predictors: %d\n", length(pred_cols)))
+cat(sprintf("Predictors: %s\n", paste(pred_cols, collapse = ", ")))
+```
+
+# 12. Session Info
+
+```{r session-info}
+#| label: session-info
+
+sessionInfo()
+```
