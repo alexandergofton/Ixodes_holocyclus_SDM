@@ -1,10 +1,169 @@
+---
+title: "Species Distribution Model for *Ixodes holocyclus* in Eastern Australia"
+author: "Alexander W. Gofton"
+date: today
+format:
+  gfm:
+    toc: true
+    toc-depth: 3
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+  cache: false
+knitr:
+  opts_chunk:
+    results: hold
+---
 
+# 1. Setup and Configuration
+
+```{r setup}
+# --- Core spatial ---
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# --- Data manipulation ---
+library(tidyverse)
+
+# --- SDM fitting ---
+library(maxnet)
+library(randomForest)
+library(gbm)
+library(dismo)
+library(mgcv)
+
+# --- SDM evaluation and tuning ---
+library(blockCV)
+library(ecospat)
+
+# --- Variable selection ---
+library(corrplot)
+
+# --- Spatial thinning ---
+library(spThin)
+
+# --- Visualisation ---
+library(patchwork)
+library(viridis)
+
+# --- Set seed for reproducibility ---
+set.seed(7990)
+
+# --- Paths ---
+base_dir <- "/Users/gof005/Library/CloudStorage/OneDrive-CSIRO/OneDrive - Docs/01_Projects/alpha_gal/02_SAP_2025-6/Ihol_SDM"
+data_dir <- file.path(base_dir, "data")
+processed_dir <- file.path(base_dir, "processed_data")
+output_dir <- file.path(base_dir, "outputs")
+figures_dir <- file.path(base_dir, "figures")
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --- Study area extent (Eastern Australia) ---
+study_extent <- ext(140, 155, -40, -10)
+
+# --- Australia boundary for maps ---
+aus <- ne_countries(country = "Australia", scale = "medium", returnclass = "sf")
+```
+
+# 2. Occurrence Data Preparation
+
+```{r occurrence-data}
+# Load GBIF occurrence records
+gbif_raw <- read_csv(file.path(data_dir, "ihol_occurrences_gbif.csv"),
+                     show_col_types = FALSE)
+
+cat("Raw GBIF records:", nrow(gbif_raw), "\n")
+
+# Clean occurrence data
+occ_clean <- gbif_raw %>%
+  select(
+    id = ID, species = scientificName,
+    lat = decimalLatitude, lon = decimalLongitude,
+    year, month, day, state = stateProvince
+  ) %>%
+  filter(!is.na(lat), !is.na(lon)) %>%
+  filter(lon >= 140, lon <= 155, lat >= -40, lat <= -10) %>%
+  distinct(lat, lon, .keep_all = TRUE) %>%
+  filter(is.na(year) | year >= 1970) %>%
+  arrange(desc(year))
+
+cat("After cleaning:", nrow(occ_clean), "unique location records\n")
+cat("Year range:", min(occ_clean$year, na.rm = TRUE), "-",
+    max(occ_clean$year, na.rm = TRUE), "\n")
+cat("States:", paste(unique(occ_clean$state), collapse = ", "), "\n")
+```
+
+## 2.1 Spatial Thinning
+
+```{r spatial-thinning}
+thinned_file <- file.path(processed_dir, "thinned_occurrences", "thinned_data_thin1.csv")
+
+if (file.exists(thinned_file)) {
+  occ_thinned <- read_csv(thinned_file, show_col_types = FALSE)
+  if ("Longitude" %in% names(occ_thinned)) {
+    occ_thinned <- occ_thinned %>% rename(lon = Longitude, lat = Latitude)
+  }
+  cat("Loaded pre-thinned data:", nrow(occ_thinned), "records\n")
+} else {
+  occ_for_thinning <- occ_clean %>% mutate(species = "I_holocyclus")
+
+  thin_dir <- file.path(processed_dir, "thinned_occurrences")
+  dir.create(thin_dir, showWarnings = FALSE, recursive = TRUE)
+
+  thinned_result <- thin(
+    loc.data = occ_for_thinning,
+    lat.col = "lat", long.col = "lon", spec.col = "species",
+    thin.par = 10, reps = 10,
+    write.files = TRUE, out.dir = thin_dir, write.log.file = FALSE
+  )
+
+  best_rep <- which.max(sapply(thinned_result, nrow))
+  occ_thinned <- thinned_result[[best_rep]]
+  cat("Thinned from", nrow(occ_clean), "to", nrow(occ_thinned), "records (10 km)\n")
+}
+```
+
+## 2.2 Map Occurrence Points
+
+```{r map-occurrences}
+#| fig-width: 8
+#| fig-height: 8
+
+p_occ <- ggplot() +
+  geom_sf(data = aus, fill = "grey90", colour = "grey40") +
+  geom_point(data = occ_clean,
+             aes(x = lon, y = lat),
+             colour = "grey60", size = 1, alpha = 0.5) +
+  geom_point(data = occ_thinned,
+             aes(x = lon, y = lat),
+             colour = "red", size = 1.5, alpha = 0.7) +
+  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  labs(
+    title = expression(italic("Ixodes holocyclus") ~ "occurrence records"),
+    subtitle = paste0("Grey: all cleaned (n=", nrow(occ_clean),
+                      "), Red: spatially thinned at 10 km (n=", nrow(occ_thinned), ")"),
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+
+print(p_occ)
+
+ggsave(file.path(figures_dir, "01_occurrence_map.png"), p_occ,
+       width = 8, height = 8, dpi = 300)
+```
 
 # 3. Environmental Data Preparation
 
 ```{r load-env-data}
-#| label: load-env-data
-
 # --- WorldClim bioclimatic variables ---
 wc_path <- file.path(data_dir, "climate_data", "climate", "wc2.1_2.5m")
 bio_files <- file.path(wc_path, paste0("wc2.1_2.5m_bio_", 1:19, ".tif"))
@@ -32,8 +191,7 @@ chelsa_path <- file.path(data_dir, "climate_data", "climate", "chelsa")
 vpd_files <- file.path(chelsa_path,
   paste0("CHELSA_vpd_", sprintf("%02d", 1:12), "_1981-2010_V.2.1.tif"))
 vpd_stack <- rast(vpd_files)
-# CHELSA VPD is stored as Pa * 100; convert to hPa
-vpd_stack <- vpd_stack / 100
+vpd_stack <- vpd_stack / 100  # CHELSA VPD: Pa * 100 -> hPa
 vpd_annual <- mean(vpd_stack, na.rm = TRUE)
 names(vpd_annual) <- "vpd_annual"
 
@@ -47,16 +205,16 @@ cat("Loaded:", nlyr(bioclim_all), "WorldClim +",
 ## 3.1 Crop, Align, and Stack
 
 ```{r align-env-data}
-#| label: align-env-data
-
 # Crop all layers to study extent
 bioclim_crop <- crop(bioclim_all, study_extent)
 
-# Resample ENVIREM and CHELSA VPD to match the WorldClim grid exactly
+# Project to match CRS before resampling (avoids CRS mismatch warnings)
 envirem_crop <- crop(envirem_vars, study_extent)
+envirem_crop <- project(envirem_crop, crs(bioclim_crop))
 envirem_resamp <- resample(envirem_crop, bioclim_crop[[1]], method = "bilinear")
 
 vpd_crop <- crop(vpd_agg, study_extent)
+vpd_crop <- project(vpd_crop, crs(bioclim_crop))
 vpd_resamp <- resample(vpd_crop, bioclim_crop[[1]], method = "bilinear")
 
 # Mask to land (Australia) using country boundary
@@ -81,20 +239,6 @@ We select variables based on ecological knowledge of *I. holocyclus* biology (Te
 ## 4.1 Candidate Variable Selection
 
 ```{r candidate-vars}
-#| label: candidate-vars
-
-# Ecologically justified candidate variables
-# Rationale:
-# - bio1:  Annual mean temp (overall thermal suitability)
-# - bio5:  Max temp warmest month (heat stress; upper limit ~32-33°C)
-# - bio6:  Min temp coldest month (cold stress; lower limit ~8°C)
-# - bio12: Annual precipitation (moisture for off-host survival)
-# - bio15: Precipitation seasonality (moisture reliability)
-# - bio4:  Temperature seasonality (continental vs. coastal)
-# - vpd_annual: Vapour pressure deficit (desiccation risk; key in Teo et al. 2024)
-# - aridity_idx: Thornthwaite aridity (integrated moisture availability)
-# - cmi_idx: Climatic moisture index
-
 candidate_vars <- c("bio1", "bio4", "bio5", "bio6", "bio12", "bio15",
                      "aridity_idx", "cmi_idx", "vpd_annual")
 
@@ -106,19 +250,16 @@ cat("Candidate variables:", paste(candidate_vars, collapse = ", "), "\n")
 ## 4.2 Multicollinearity Check
 
 ```{r multicollinearity}
-#| label: multicollinearity
 #| fig-width: 8
 #| fig-height: 8
 
 # Extract values at occurrence points for correlation analysis
 occ_pts <- vect(occ_thinned, geom = c("lon", "lat"), crs = "EPSG:4326")
 occ_env <- terra::extract(env_candidates, occ_pts)
-occ_env <- occ_env[complete.cases(occ_env), -1]  # remove ID, remove NAs
+occ_env <- occ_env[complete.cases(occ_env), -1]
 
-# Correlation matrix
 cor_mat <- cor(occ_env, use = "pairwise.complete.obs")
 
-# Plot correlation matrix
 corrplot(cor_mat, method = "color", type = "lower",
          addCoef.col = "black", number.cex = 0.7,
          tl.col = "black", tl.cex = 0.8,
@@ -141,47 +282,31 @@ if (nrow(high_cor) > 0) {
 ## 4.3 Variable Reduction
 
 ```{r variable-reduction}
-#| label: variable-reduction
-
-# Decision rules for removing correlated variables:
-# If bio1 correlates with bio5 or bio6 -> keep bio5 and bio6 (more ecologically
-#   specific: heat/cold limits match known thresholds)
-# If bio12 correlates with cmi_idx or aridity_idx -> keep bio12 + one moisture index
-# If vpd_annual correlates with aridity_idx or cmi_idx -> keep vpd_annual
-#   (directly linked to tick desiccation)
-
-# Start with all candidates and iteratively remove
 vars_to_remove <- c()
 
-# Check each pair and apply removal rules
-# bio1 vs bio5/bio6: bio1 is a mean; bio5 and bio6 capture extremes -> remove bio1
 if (abs(cor_mat["bio1", "bio5"]) > 0.7 | abs(cor_mat["bio1", "bio6"]) > 0.7) {
   vars_to_remove <- c(vars_to_remove, "bio1")
   cat("Removing bio1: correlated with bio5/bio6; extremes more ecologically relevant\n")
 }
 
-# aridity_idx vs cmi_idx: these are both moisture indices -> keep cmi_idx
 if (abs(cor_mat["aridity_idx", "cmi_idx"]) > 0.7) {
   vars_to_remove <- c(vars_to_remove, "aridity_idx")
   cat("Removing aridity_idx: correlated with cmi_idx\n")
 }
 
-# vpd_annual vs cmi_idx: if correlated, keep vpd (more mechanistic for tick desiccation)
 if (abs(cor_mat["vpd_annual", "cmi_idx"]) > 0.7) {
   vars_to_remove <- c(vars_to_remove, "cmi_idx")
   cat("Removing cmi_idx: correlated with vpd_annual; VPD is more directly relevant\n")
 }
 
-# bio4 vs bio5 or bio6: if correlated, remove bio4
 if (abs(cor_mat["bio4", "bio5"]) > 0.7 | abs(cor_mat["bio4", "bio6"]) > 0.7) {
   vars_to_remove <- c(vars_to_remove, "bio4")
   cat("Removing bio4: correlated with temperature extremes\n")
 }
 
-# Apply removals
 final_vars <- setdiff(candidate_vars, vars_to_remove)
 
-# If we still have >7 variables or any remaining high correlations, do another pass
+# Second pass: remove any remaining high correlations
 env_final_vals <- occ_env[, final_vars]
 cor_final <- cor(env_final_vals, use = "pairwise.complete.obs")
 remaining_high <- which(abs(cor_final) > 0.7 & upper.tri(cor_final), arr.ind = TRUE)
@@ -193,8 +318,6 @@ if (nrow(remaining_high) > 0) {
     v2 <- colnames(cor_final)[remaining_high[i, 2]]
     r <- cor_final[remaining_high[i, 1], remaining_high[i, 2]]
     cat(sprintf("  %s vs %s: r = %.2f\n", v1, v2, r))
-    # Remove the less ecologically important one
-    # Priority: bio5 > bio6 > vpd_annual > bio12 > bio15 > bio4 > cmi_idx > aridity_idx
     if (v2 %in% c("cmi_idx", "aridity_idx", "bio4", "bio15")) {
       final_vars <- setdiff(final_vars, v2)
       cat(sprintf("  -> Removing %s\n", v2))
@@ -205,24 +328,18 @@ if (nrow(remaining_high) > 0) {
   }
 }
 
-# Ensure we have at least 4 and at most 7 variables
 cat("\nFinal predictor set (", length(final_vars), "variables):",
     paste(final_vars, collapse = ", "), "\n")
 
-# Subset environmental stack
 env_model <- env_all[[final_vars]]
 ```
 
 ## 4.4 VIF Check
 
 ```{r vif-check}
-#| label: vif-check
-
-# Calculate VIF manually (terra-based approach)
 occ_env_final <- occ_env[, final_vars]
 occ_env_final <- occ_env_final[complete.cases(occ_env_final), ]
 
-# VIF calculation
 calc_vif <- function(df) {
   vif_vals <- numeric(ncol(df))
   names(vif_vals) <- names(df)
@@ -239,7 +356,6 @@ vif_values <- calc_vif(occ_env_final)
 cat("VIF values:\n")
 print(round(vif_values, 2))
 
-# Remove any with VIF > 10 (iteratively)
 while (max(vif_values) > 10 & length(final_vars) > 3) {
   worst <- names(which.max(vif_values))
   cat("Removing", worst, "with VIF =", round(max(vif_values), 2), "\n")
@@ -253,24 +369,16 @@ cat("\nFinal variables after VIF screening (", length(final_vars), "):",
 cat("VIF values:\n")
 print(round(vif_values, 2))
 
-# Update environmental stack
 env_model <- env_all[[final_vars]]
 ```
 
 # 5. Background Point Generation
 
-We generate background points (pseudo-absences) for model fitting. These represent the available environmental conditions within the study area.
-
 ```{r background-points}
-#| label: background-points
-
-# Generate random background points within the study area, on land
 n_bg <- 10000
 
-# Use the first environmental layer as a template (non-NA = land)
 land_mask <- !is.na(env_model[[1]])
 
-# Sample random cells from land
 bg_cells <- spatSample(land_mask, size = n_bg, method = "random",
                        cells = TRUE, na.rm = TRUE)
 
@@ -282,15 +390,12 @@ names(bg_df) <- c("lon", "lat")
 occ_sf_pts <- st_as_sf(occ_thinned, coords = c("lon", "lat"), crs = 4326)
 bg_sf_pts <- st_as_sf(bg_df, coords = c("lon", "lat"), crs = 4326)
 
-# Calculate minimum distance from each background point to nearest occurrence
-# Using a 5 km buffer (~0.045 degrees)
 min_dist <- st_distance(bg_sf_pts, occ_sf_pts)
-min_dist_km <- apply(min_dist, 1, min) / 1000  # Convert metres to km
+min_dist_km <- apply(min_dist, 1, min) / 1000
 
 bg_df <- bg_df[min_dist_km > 5, ]
 cat("Background points after 5 km buffer:", nrow(bg_df), "\n")
 
-# Trim to target number if we have too many
 if (nrow(bg_df) > n_bg) {
   bg_df <- bg_df[sample(nrow(bg_df), n_bg), ]
 }
@@ -301,19 +406,15 @@ cat("Final background points:", nrow(bg_df), "\n")
 ## 5.1 Extract Environmental Values and Build Modelling Dataset
 
 ```{r modelling-dataset}
-#| label: modelling-dataset
-
-# Extract environmental values at occurrence points
 occ_vect <- vect(occ_thinned, geom = c("lon", "lat"), crs = "EPSG:4326")
 occ_env_vals <- terra::extract(env_model, occ_vect)
 occ_env_vals <- data.frame(
   presence = 1,
   lon = occ_thinned$lon,
   lat = occ_thinned$lat,
-  occ_env_vals[, -1]  # Remove ID column
+  occ_env_vals[, -1]
 )
 
-# Extract at background points
 bg_vect <- vect(bg_df, geom = c("lon", "lat"), crs = "EPSG:4326")
 bg_env_vals <- terra::extract(env_model, bg_vect)
 bg_env_vals <- data.frame(
@@ -323,7 +424,6 @@ bg_env_vals <- data.frame(
   bg_env_vals[, -1]
 )
 
-# Combine into single modelling dataset
 model_data <- rbind(occ_env_vals, bg_env_vals)
 model_data <- model_data[complete.cases(model_data), ]
 
@@ -335,7 +435,6 @@ cat("Modelling dataset: ", sum(model_data$presence == 1), "presences +",
 ## 5.2 Map Presence and Background Points
 
 ```{r map-points}
-#| label: map-points
 #| fig-width: 8
 #| fig-height: 8
 
@@ -361,22 +460,14 @@ print(p_points)
 
 # 6. Spatial Cross-Validation Setup
 
-We use spatially-blocked cross-validation to avoid inflated accuracy metrics caused by spatial autocorrelation.
-
 ```{r spatial-cv}
-#| label: spatial-cv
-
-# Convert modelling data to sf
 model_sf <- st_as_sf(model_data, coords = c("lon", "lat"), crs = 4326)
 
-# Create spatial blocks for cross-validation
-# Block size should approximate the spatial autocorrelation range
-# For tick distributions at this scale, ~200 km is reasonable
 sb <- cv_spatial(
   x = model_sf,
   column = "presence",
   k = 5,
-  size = 200000,  # 200 km in metres
+  size = 200000,
   selection = "random",
   iteration = 100,
   progress = FALSE
@@ -398,21 +489,15 @@ for (i in 1:5) {
 ## 7.1 Helper Functions
 
 ```{r helper-functions}
-#| label: helper-functions
-
-# Function to calculate AUC
 calc_auc <- function(obs, pred) {
-  # obs: 0/1 vector, pred: predicted probabilities
   n1 <- sum(obs == 1)
   n0 <- sum(obs == 0)
   if (n1 == 0 | n0 == 0) return(NA)
-
   ranks <- rank(pred)
   auc <- (sum(ranks[obs == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
   return(auc)
 }
 
-# Function to calculate TSS (at threshold maximising TSS)
 calc_tss <- function(obs, pred, n_thresholds = 100) {
   thresholds <- seq(min(pred), max(pred), length.out = n_thresholds)
   tss_vals <- sapply(thresholds, function(t) {
@@ -430,7 +515,6 @@ calc_tss <- function(obs, pred, n_thresholds = 100) {
   return(list(tss = tss_vals[best_idx], threshold = thresholds[best_idx]))
 }
 
-# Function to calculate Boyce Index
 calc_boyce <- function(obs, pred) {
   tryCatch({
     bi <- ecospat.boyce(fit = pred, obs = pred[obs == 1],
@@ -444,13 +528,7 @@ calc_boyce <- function(obs, pred) {
 ## 7.2 Cross-Validated Model Fitting
 
 ```{r cv-model-fitting}
-#| label: cv-model-fitting
-#| cache: true
-
-# Prepare storage for CV results
 cv_results <- list()
-
-# Predictor columns
 pred_cols <- final_vars
 
 for (fold_i in 1:5) {
@@ -467,6 +545,10 @@ for (fold_i in 1:5) {
   test_x <- as.data.frame(test_data[, pred_cols])
   train_y <- train_data$presence
   test_y <- test_data$presence
+
+  # Case weights for GAM/GLM (correct prevalence bias)
+  n_pres_fold <- sum(train_y == 1); n_bg_fold <- sum(train_y == 0)
+  fold_wts <- ifelse(train_y == 1, n_bg_fold / n_pres_fold, 1)
 
   fold_results <- list()
 
@@ -505,7 +587,7 @@ for (fold_i in 1:5) {
     fold_results$rf <<- list(auc = NA, tss = NA, boyce = NA)
   })
 
-  # --- 3. BRT (Boosted Regression Trees) ---
+  # --- 3. BRT ---
   tryCatch({
     brt_data <- cbind(presence = train_y, train_x)
     brt_model <- gbm.step(
@@ -531,7 +613,6 @@ for (fold_i in 1:5) {
       )
       cat("  BRT AUC:", round(fold_results$brt$auc, 3), "\n")
     } else {
-      # Try with lower learning rate
       brt_model <- gbm.step(
         data = brt_data,
         gbm.x = which(names(brt_data) %in% pred_cols),
@@ -563,16 +644,16 @@ for (fold_i in 1:5) {
     fold_results$brt <<- list(auc = NA, tss = NA, boyce = NA)
   })
 
-  # --- 4. GAM ---
+  # --- 4. GAM (with case weights) ---
   tryCatch({
     gam_data <- cbind(presence = train_y, train_x)
-    # Build formula with smooth terms
     smooth_terms <- paste0("s(", pred_cols, ", k = 5)")
     gam_formula <- as.formula(
       paste("presence ~", paste(smooth_terms, collapse = " + "))
     )
     gam_model <- gam(gam_formula, data = gam_data,
                      family = binomial(link = "logit"),
+                     weights = fold_wts,
                      method = "REML")
     gam_pred <- predict(gam_model, test_x, type = "response")
     fold_results$gam <- list(
@@ -586,21 +667,18 @@ for (fold_i in 1:5) {
     fold_results$gam <<- list(auc = NA, tss = NA, boyce = NA)
   })
 
-  # --- 5. GLM ---
+  # --- 5. GLM (with case weights) ---
   tryCatch({
     glm_data <- cbind(presence = train_y, train_x)
-    # Linear + quadratic terms for temperature, linear for others
     temp_vars <- pred_cols[grepl("bio5|bio6", pred_cols)]
     other_vars <- setdiff(pred_cols, temp_vars)
-    glm_terms <- c(
-      other_vars,
-      paste0("poly(", temp_vars, ", 2)")
-    )
+    glm_terms <- c(other_vars, paste0("poly(", temp_vars, ", 2)"))
     glm_formula <- as.formula(
       paste("presence ~", paste(glm_terms, collapse = " + "))
     )
     glm_model <- glm(glm_formula, data = glm_data,
-                     family = binomial(link = "logit"))
+                     family = binomial(link = "logit"),
+                     weights = fold_wts)
     glm_pred <- predict(glm_model, test_x, type = "response")
     fold_results$glm <- list(
       auc = calc_auc(test_y, glm_pred),
@@ -620,9 +698,6 @@ for (fold_i in 1:5) {
 ## 7.3 Cross-Validation Summary
 
 ```{r cv-summary}
-#| label: cv-summary
-
-# Compile CV results into a data frame
 algorithms <- c("maxent", "rf", "brt", "gam", "glm")
 algo_names <- c("MaxEnt", "Random Forest", "BRT", "GAM", "GLM")
 
@@ -652,20 +727,18 @@ cat("SPATIAL CROSS-VALIDATION RESULTS (5-fold)\n")
 cat("========================================\n\n")
 print(cv_summary, row.names = FALSE)
 
-# Save CV summary
 write_csv(cv_summary, file.path(output_dir, "cv_performance_summary.csv"))
 ```
 
 # 8. Full Model Fitting (All Data)
 
-Now we refit each algorithm on the complete dataset for final predictions.
-
 ```{r full-model-fitting}
-#| label: full-model-fitting
-#| cache: true
-
 all_x <- as.data.frame(model_data[, pred_cols])
 all_y <- model_data$presence
+
+# Case weights for GAM/GLM (correct prevalence bias)
+n_pres <- sum(all_y == 1); n_bg <- sum(all_y == 0)
+case_wts <- ifelse(all_y == 1, n_bg / n_pres, 1)
 
 full_models <- list()
 
@@ -698,7 +771,6 @@ full_models$brt <- gbm.step(
   plot.main = FALSE
 )
 
-# If BRT fails with these settings, try lower learning rate
 if (is.null(full_models$brt)) {
   full_models$brt <- gbm.step(
     data = brt_full_data,
@@ -713,7 +785,7 @@ if (is.null(full_models$brt)) {
   )
 }
 
-# --- 4. GAM ---
+# --- 4. GAM (with case weights) ---
 cat("Fitting GAM on full data...\n")
 gam_full_data <- cbind(presence = all_y, all_x)
 smooth_terms <- paste0("s(", pred_cols, ", k = 5)")
@@ -722,9 +794,10 @@ gam_formula <- as.formula(
 )
 full_models$gam <- gam(gam_formula, data = gam_full_data,
                        family = binomial(link = "logit"),
+                       weights = case_wts,
                        method = "REML")
 
-# --- 5. GLM ---
+# --- 5. GLM (with case weights) ---
 cat("Fitting GLM on full data...\n")
 glm_full_data <- cbind(presence = all_y, all_x)
 temp_vars <- pred_cols[grepl("bio5|bio6", pred_cols)]
@@ -734,7 +807,8 @@ glm_formula <- as.formula(
   paste("presence ~", paste(glm_terms, collapse = " + "))
 )
 full_models$glm <- glm(glm_formula, data = glm_full_data,
-                       family = binomial(link = "logit"))
+                       family = binomial(link = "logit"),
+                       weights = case_wts)
 
 cat("All models fitted successfully.\n")
 ```
@@ -742,14 +816,9 @@ cat("All models fitted successfully.\n")
 ## 8.1 Variable Importance
 
 ```{r variable-importance}
-#| label: variable-importance
 #| fig-width: 10
 #| fig-height: 6
 
-# MaxEnt variable importance (from model coefficients)
-# Use permutation-based importance where available
-
-# Random Forest importance
 rf_imp <- importance(full_models$rf, type = 2)
 rf_imp_df <- data.frame(
   Variable = rownames(rf_imp),
@@ -758,7 +827,6 @@ rf_imp_df <- data.frame(
 )
 rf_imp_df$Importance <- rf_imp_df$Importance / max(rf_imp_df$Importance) * 100
 
-# BRT importance
 if (!is.null(full_models$brt)) {
   brt_imp <- summary(full_models$brt, plotit = FALSE)
   brt_imp_df <- data.frame(
@@ -768,7 +836,6 @@ if (!is.null(full_models$brt)) {
   )
 }
 
-# Combine
 var_imp_all <- bind_rows(rf_imp_df, brt_imp_df)
 
 p_varimp <- ggplot(var_imp_all, aes(x = reorder(Variable, Importance),
@@ -790,17 +857,17 @@ ggsave(file.path(figures_dir, "02_variable_importance.png"), p_varimp,
 ## 8.2 Response Curves
 
 ```{r response-curves}
-#| label: response-curves
 #| fig-width: 12
 #| fig-height: 8
 
-# Generate response curves from GAM (smoothest, most interpretable)
-# For each variable, predict across its range while holding others at median
+# Use occurrence-point medians as baseline (not full-data means,
+# which are dominated by background in unsuitable areas)
+occ_x <- all_x[all_y == 1, ]
+occ_medians <- apply(occ_x, 2, median, na.rm = TRUE)
 
 response_plots <- list()
 
 for (var in pred_cols) {
-  # Create prediction data: vary focal variable, hold others at median
   var_range <- seq(
     min(all_x[[var]], na.rm = TRUE),
     max(all_x[[var]], na.rm = TRUE),
@@ -808,17 +875,15 @@ for (var in pred_cols) {
   )
 
   pred_data <- as.data.frame(
-    matrix(rep(colMeans(all_x, na.rm = TRUE), each = 200),
+    matrix(rep(occ_medians, each = 200),
            nrow = 200, dimnames = list(NULL, pred_cols))
   )
   pred_data[[var]] <- var_range
 
-  # Predict from GAM
   gam_response <- predict(full_models$gam, pred_data, type = "response")
 
   response_df <- data.frame(x = var_range, y = gam_response)
 
-  # Mark the observed range at occurrence points
   occ_subset <- occ_env_vals[occ_env_vals[["presence"]] == 1, ]
   occ_range <- range(occ_subset[[var]], na.rm = TRUE)
 
@@ -847,35 +912,30 @@ ggsave(file.path(figures_dir, "03_response_curves.png"), p_response,
 # 9. Ensemble Prediction
 
 ```{r ensemble-prediction}
-#| label: ensemble-prediction
-#| cache: true
-
-# Predict habitat suitability from each model across the study area
-# We extract all raster values as a data frame, predict in R, then write back
-# to raster. This avoids compatibility issues with terra::predict() for
-# different model types.
-
 cat("Extracting raster values for prediction...\n")
 
-# Get all cell values as a data frame
 env_df <- as.data.frame(env_model, xy = TRUE, cells = TRUE, na.rm = TRUE)
-pred_df <- env_df[, final_vars]  # Just the predictor columns
+pred_df <- env_df[, final_vars]
+
+# Helper: write predictions back into a raster template
+fill_raster <- function(template, cells, vals, name) {
+  r <- init(template[[1]], fun = NA)
+  v <- as.matrix(values(r))
+  v[cells, 1] <- as.numeric(vals)
+  values(r) <- v
+  names(r) <- name
+  r
+}
 
 # --- MaxEnt ---
 cat("  Predicting MaxEnt...\n")
 me_pred_vals <- predict(full_models$maxent, pred_df, type = "cloglog")
-pred_maxent <- env_model[[1]]
-pred_maxent[] <- NA
-pred_maxent[env_df$cell] <- me_pred_vals
-names(pred_maxent) <- "maxent"
+pred_maxent <- fill_raster(env_model, env_df$cell, me_pred_vals, "maxent")
 
 # --- Random Forest ---
 cat("  Predicting Random Forest...\n")
 rf_pred_vals <- predict(full_models$rf, pred_df, type = "prob")[, "1"]
-pred_rf <- env_model[[1]]
-pred_rf[] <- NA
-pred_rf[env_df$cell] <- rf_pred_vals
-names(pred_rf) <- "rf"
+pred_rf <- fill_raster(env_model, env_df$cell, rf_pred_vals, "rf")
 
 # --- BRT ---
 cat("  Predicting BRT...\n")
@@ -883,12 +943,8 @@ if (!is.null(full_models$brt)) {
   brt_pred_vals <- predict(full_models$brt, pred_df,
                            n.trees = full_models$brt$gbm.call$best.trees,
                            type = "response")
-  pred_brt <- env_model[[1]]
-  pred_brt[] <- NA
-  pred_brt[env_df$cell] <- brt_pred_vals
-  names(pred_brt) <- "brt"
+  pred_brt <- fill_raster(env_model, env_df$cell, brt_pred_vals, "brt")
 } else {
-  # Fallback: use mean of other models if BRT failed
   cat("  WARNING: BRT model was NULL; using placeholder\n")
   pred_brt <- NULL
 }
@@ -896,18 +952,12 @@ if (!is.null(full_models$brt)) {
 # --- GAM ---
 cat("  Predicting GAM...\n")
 gam_pred_vals <- predict(full_models$gam, pred_df, type = "response")
-pred_gam <- env_model[[1]]
-pred_gam[] <- NA
-pred_gam[env_df$cell] <- gam_pred_vals
-names(pred_gam) <- "gam"
+pred_gam <- fill_raster(env_model, env_df$cell, gam_pred_vals, "gam")
 
 # --- GLM ---
 cat("  Predicting GLM...\n")
 glm_pred_vals <- predict(full_models$glm, pred_df, type = "response")
-pred_glm <- env_model[[1]]
-pred_glm[] <- NA
-pred_glm[env_df$cell] <- glm_pred_vals
-names(pred_glm) <- "glm"
+pred_glm <- fill_raster(env_model, env_df$cell, glm_pred_vals, "glm")
 
 cat("Individual model predictions generated.\n")
 ```
@@ -915,16 +965,10 @@ cat("Individual model predictions generated.\n")
 ## 9.1 AUC-Weighted Ensemble
 
 ```{r ensemble-weights}
-#| label: ensemble-weights
-
-# Calculate AUC-based weights from cross-validation
 weights <- cv_summary$AUC_mean
 names(weights) <- algorithms
 
-# Normalise weights to sum to 1
 weights <- weights / sum(weights, na.rm = TRUE)
-
-# Handle any NAs (set weight to 0)
 weights[is.na(weights)] <- 0
 
 cat("Ensemble weights (proportional to CV AUC):\n")
@@ -933,7 +977,6 @@ for (i in seq_along(algo_names)) {
               algo_names[i], weights[i], cv_summary$AUC_mean[i]))
 }
 
-# Build list of available predictions and corresponding weights
 pred_list <- list(maxent = pred_maxent, rf = pred_rf, gam = pred_gam, glm = pred_glm)
 weight_list <- weights[c("maxent", "rf", "gam", "glm")]
 
@@ -942,17 +985,14 @@ if (!is.null(pred_brt)) {
   weight_list <- c(weight_list, weights["brt"])
 }
 
-# Renormalise weights to available models
 weight_list <- weight_list / sum(weight_list, na.rm = TRUE)
 
-# Compute weighted ensemble
-ensemble_mean <- pred_list[[1]] * 0  # Initialise to zero raster
+ensemble_mean <- pred_list[[1]] * 0
 for (nm in names(pred_list)) {
   ensemble_mean <- ensemble_mean + pred_list[[nm]] * weight_list[nm]
 }
 names(ensemble_mean) <- "ensemble_suitability"
 
-# Prediction uncertainty (SD across models)
 pred_stack <- rast(pred_list)
 ensemble_sd <- app(pred_stack, fun = "sd", na.rm = TRUE)
 names(ensemble_sd) <- "ensemble_uncertainty"
@@ -965,31 +1005,24 @@ cat("Suitability range:", round(global(ensemble_mean, "min", na.rm = TRUE)[[1]],
 ## 9.2 Binary Threshold Map
 
 ```{r binary-map}
-#| label: binary-map
-
-# Find the threshold that maximises TSS on the full training data
 full_pred_at_points <- terra::extract(ensemble_mean, occ_vect)$ensemble_suitability
 full_pred_at_bg <- terra::extract(ensemble_mean, bg_vect)$ensemble_suitability
 
 full_preds <- c(full_pred_at_points, full_pred_at_bg)
 full_obs <- c(rep(1, length(full_pred_at_points)), rep(0, length(full_pred_at_bg)))
 
-# Remove NAs
 valid <- complete.cases(full_preds, full_obs)
 tss_result <- calc_tss(full_obs[valid], full_preds[valid])
 
 cat("Optimal TSS threshold:", round(tss_result$threshold, 3), "\n")
 cat("TSS at threshold:", round(tss_result$tss, 3), "\n")
 
-# Create binary map
 ensemble_binary <- ensemble_mean >= tss_result$threshold
 names(ensemble_binary) <- "predicted_presence"
 
-# Calculate area of suitable habitat
-# cellSize with unit="km" returns area in km²
 cell_areas <- cellSize(ensemble_binary, unit = "km")
 suitable_area <- global(ensemble_binary * cell_areas, "sum", na.rm = TRUE)[[1]]
-cat("Predicted suitable area:", format(round(suitable_area), big.mark = ","), "km²\n")
+cat("Predicted suitable area:", format(round(suitable_area), big.mark = ","), "km2\n")
 ```
 
 # 10. Visualisation and Output
@@ -997,11 +1030,9 @@ cat("Predicted suitable area:", format(round(suitable_area), big.mark = ","), "k
 ## 10.1 Ensemble Suitability Map
 
 ```{r map-ensemble}
-#| label: map-ensemble
 #| fig-width: 10
 #| fig-height: 10
 
-# Convert rasters to data frames for ggplot
 ensemble_df <- as.data.frame(ensemble_mean, xy = TRUE, na.rm = TRUE)
 names(ensemble_df) <- c("x", "y", "suitability")
 
@@ -1031,23 +1062,22 @@ ggsave(file.path(figures_dir, "04_ensemble_suitability.png"), p_ensemble,
 ## 10.2 Binary Presence Map
 
 ```{r map-binary}
-#| label: map-binary
 #| fig-width: 10
 #| fig-height: 10
 
 binary_df <- as.data.frame(ensemble_binary, xy = TRUE, na.rm = TRUE)
 names(binary_df) <- c("x", "y", "presence")
-binary_df$presence <- factor(binary_df$presence,
-                             levels = c(0, 1),
+binary_df$presence <- factor(as.integer(binary_df$presence),
+                             levels = c(0L, 1L),
                              labels = c("Unsuitable", "Suitable"))
 
 p_binary <- ggplot() +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
   geom_raster(data = binary_df,
               aes(x = x, y = y, fill = presence)) +
-  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
   geom_point(data = occ_thinned, aes(x = lon, y = lat),
-             colour = "red", size = 0.8, alpha = 0.5, shape = 16) +
-  scale_fill_manual(values = c("Unsuitable" = "grey85", "Suitable" = "darkgreen"),
+             colour = "red", size = 0.8, alpha = 0.8, shape = 16) +
+  scale_fill_manual(values = c("Unsuitable" = "grey60", "Suitable" = "lightblue"),
                     name = "") +
   coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
   labs(
@@ -1068,7 +1098,6 @@ ggsave(file.path(figures_dir, "05_binary_distribution.png"), p_binary,
 ## 10.3 Prediction Uncertainty Map
 
 ```{r map-uncertainty}
-#| label: map-uncertainty
 #| fig-width: 10
 #| fig-height: 10
 
@@ -1098,11 +1127,9 @@ ggsave(file.path(figures_dir, "06_prediction_uncertainty.png"), p_uncert,
 ## 10.4 Individual Model Comparison
 
 ```{r map-individual-models}
-#| label: map-individual-models
 #| fig-width: 14
 #| fig-height: 10
 
-# Convert each model prediction to data frame
 make_pred_df <- function(rast, name) {
   df <- as.data.frame(rast, xy = TRUE, na.rm = TRUE)
   names(df) <- c("x", "y", "suitability")
@@ -1147,12 +1174,9 @@ ggsave(file.path(figures_dir, "07_model_comparison.png"), p_compare,
 ## 10.5 Save GeoTIFF Outputs
 
 ```{r save-outputs}
-#| label: save-outputs
-
 sdm_output_dir <- file.path(output_dir, "sdm_results")
 dir.create(sdm_output_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Save ensemble outputs
 writeRaster(ensemble_mean,
             file.path(sdm_output_dir, "ensemble_suitability.tif"),
             overwrite = TRUE)
@@ -1163,7 +1187,6 @@ writeRaster(ensemble_binary,
             file.path(sdm_output_dir, "ensemble_binary.tif"),
             overwrite = TRUE)
 
-# Save individual model predictions
 writeRaster(pred_maxent,
             file.path(sdm_output_dir, "pred_maxent.tif"),
             overwrite = TRUE)
@@ -1182,39 +1205,37 @@ writeRaster(pred_glm,
             file.path(sdm_output_dir, "pred_glm.tif"),
             overwrite = TRUE)
 
-cat("All GeoTIFF outputs saved to:", sdm_output_dir, "\n")
+saveRDS(weights, file.path(sdm_output_dir, "ensemble_weights.rds"))
+saveRDS(tss_result, file.path(sdm_output_dir, "tss_result.rds"))
+
+cat("All outputs saved to:", sdm_output_dir, "\n")
 ```
 
 # 11. Ecological Validation
 
 ```{r ecological-validation}
-#| label: ecological-validation
-
-# --- Check against known physiological thresholds ---
-
 # Extract environmental values at predicted suitable locations
 suitable_cells <- as.data.frame(ensemble_binary, xy = TRUE, na.rm = TRUE)
-suitable_cells <- suitable_cells[suitable_cells[[3]] == 1, ]
+suitable_cells <- suitable_cells[as.integer(suitable_cells[[3]]) == 1L, ]
 suitable_vect <- vect(suitable_cells[, 1:2], geom = c("x", "y"), crs = "EPSG:4326")
 suitable_env <- terra::extract(env_all, suitable_vect)
 
 cat("=== Ecological Validation ===\n\n")
 
-# Temperature checks (from Heath 1974, Teo et al. 2021)
 if ("bio5" %in% names(suitable_env)) {
   bio5_range <- range(suitable_env$bio5, na.rm = TRUE)
-  cat(sprintf("Max temp warmest month (bio5) in suitable area: %.1f - %.1f °C\n",
+  cat(sprintf("Max temp warmest month (bio5) in suitable area: %.1f - %.1f C\n",
               bio5_range[1], bio5_range[2]))
-  cat(sprintf("  Expected upper limit: ~32-33°C (Heat stress threshold)\n"))
+  cat(sprintf("  Expected upper limit: ~32-33C (Heat stress threshold)\n"))
   cat(sprintf("  Check: %s\n\n",
               ifelse(bio5_range[2] <= 35, "PASS", "WARNING - exceeds expected limit")))
 }
 
 if ("bio6" %in% names(suitable_env)) {
   bio6_range <- range(suitable_env$bio6, na.rm = TRUE)
-  cat(sprintf("Min temp coldest month (bio6) in suitable area: %.1f - %.1f °C\n",
+  cat(sprintf("Min temp coldest month (bio6) in suitable area: %.1f - %.1f C\n",
               bio6_range[1], bio6_range[2]))
-  cat(sprintf("  Expected lower limit: ~8°C (Developmental threshold)\n"))
+  cat(sprintf("  Expected lower limit: ~8C (Developmental threshold)\n"))
   cat(sprintf("  Check: %s\n\n",
               ifelse(bio6_range[1] >= -2, "PASS - within reasonable range",
                      "WARNING - well below expected limit")))
@@ -1227,7 +1248,6 @@ if ("bio12" %in% names(suitable_env)) {
   cat(sprintf("  Expected: >500 mm (moisture requirement for off-host survival)\n\n"))
 }
 
-# --- Geographic range check ---
 cat("Geographic extent of predicted suitable habitat:\n")
 cat(sprintf("  Latitude: %.1f to %.1f S\n",
             abs(max(suitable_cells$y)), abs(min(suitable_cells$y))))
@@ -1235,15 +1255,13 @@ cat(sprintf("  Longitude: %.1f to %.1f E\n",
             min(suitable_cells$x), max(suitable_cells$x)))
 cat("\n")
 cat("Expected range (Teo et al. 2021):\n")
-cat("  Coastal fringe from north QLD (~15°S) to eastern VIC (~38°S)\n")
+cat("  Coastal fringe from north QLD (~15S) to eastern VIC (~38S)\n")
 cat("  Predominantly east of the Great Dividing Range\n")
 ```
 
 ## 11.1 Cross-Validation Performance Summary
 
 ```{r final-summary}
-#| label: final-summary
-
 cat("\n")
 cat("===================================================\n")
 cat("  FINAL MODEL PERFORMANCE SUMMARY\n")
@@ -1266,7 +1284,5 @@ cat(sprintf("Predictors: %s\n", paste(pred_cols, collapse = ", ")))
 # 12. Session Info
 
 ```{r session-info}
-#| label: session-info
-
 sessionInfo()
 ```
