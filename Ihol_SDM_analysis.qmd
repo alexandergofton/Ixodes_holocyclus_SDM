@@ -52,6 +52,7 @@ library(spThin)
 # --- Visualisation ---
 library(patchwork)
 library(viridis)
+library(leaflet)
 
 # --- Set seed for reproducibility ---
 set.seed(7990)
@@ -68,7 +69,7 @@ dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
 
 # --- Study area extent (Eastern Australia) ---
-study_extent <- ext(140, 155, -40, -10)
+study_extent <- ext(140, 155, -44, -10)
 
 # --- Australia boundary for maps ---
 aus <- ne_countries(country = "Australia", scale = "medium", returnclass = "sf")
@@ -92,7 +93,7 @@ occ_clean <- gbif_raw %>%
     year, month, day, state = stateProvince
   ) %>%
   filter(!is.na(lat), !is.na(lon)) %>%
-  filter(lon >= 140, lon <= 155, lat >= -40, lat <= -10) %>%
+  filter(lon >= 140, lon <= 155, lat >= -44, lat <= -10) %>%
   distinct(lat, lon, .keep_all = TRUE) %>%
   filter(is.na(year) | year >= 1970) %>%
   arrange(desc(year))
@@ -147,7 +148,7 @@ p_occ <- ggplot() +
              aes(x = lon, y = lat),
              shape = 21, fill = "red", colour = "black",
              stroke = 0.3, size = 1.5, alpha = 1) +
-  coord_sf(xlim = c(141, 155), ylim = c(-40, -10)) +
+  coord_sf(xlim = c(141, 155), ylim = c(-44, -10)) +
   labs(
     title = expression(italic("Ixodes holocyclus") ~ "occurrence records"),
     subtitle = paste0("Grey: all cleaned (n=", nrow(occ_clean),
@@ -271,6 +272,17 @@ occ_env <- occ_env[complete.cases(occ_env), -1]
 
 cor_mat <- cor(occ_env, use = "pairwise.complete.obs")
 
+png(file.path(figures_dir, "02_correlations.png"),
+    width = 800, height = 800, res = 150)
+
+corrplot(cor_mat, method = "color", type = "lower",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.cex = 0.8,
+         title = "Pairwise correlations among candidate predictors",
+         mar = c(0, 0, 2, 0))
+dev.off()
+
+# Also render inline
 corrplot(cor_mat, method = "color", type = "lower",
          addCoef.col = "black", number.cex = 0.7,
          tl.col = "black", tl.cex = 0.8,
@@ -420,7 +432,7 @@ ggplot() +
   geom_sf(data = accessible_area, fill = "lightblue", alpha = 0.3,
           colour = "blue", linewidth = 0.5) +
   geom_sf(data = occ_sf, colour = "red", size = 0.8, alpha = 0.6) +
-  coord_sf(xlim = c(130, 155), ylim = c(-40, -10)) +
+  coord_sf(xlim = c(130, 155), ylim = c(-44, -10)) +
   labs(
     title = expression("Accessible area (M) for" ~ italic("Ixodes holocyclus")),
     subtitle = sprintf("500 km buffer around occurrences (land only) — %.0f km²", area_km2)
@@ -530,7 +542,7 @@ p_points <- ggplot() +
     colour = NULL,
     linewidth = 0.2
   ) +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  coord_sf(xlim = c(140, 155), ylim = c(-44, -10)) +
   labs(
     title = "Modelling dataset",
     subtitle = paste0(
@@ -915,16 +927,17 @@ cat("All models fitted successfully.\n")
 
 ```{r variable-importance}
 #| fig-width: 10
-#| fig-height: 6
+#| fig-height: 8
 
+# --- Random Forest: Mean Decrease Gini (built-in) ---
 rf_imp <- importance(full_models$rf, type = 2)
 rf_imp_df <- data.frame(
   Variable = rownames(rf_imp),
-  Importance = rf_imp[, 1],
+  Importance = rf_imp[, 1] / max(rf_imp[, 1]) * 100,
   Algorithm = "Random Forest"
 )
-rf_imp_df$Importance <- rf_imp_df$Importance / max(rf_imp_df$Importance) * 100
 
+# --- BRT: relative influence (built-in) ---
 if (!is.null(full_models$brt)) {
   brt_imp <- summary(full_models$brt, plotit = FALSE)
   brt_imp_df <- data.frame(
@@ -932,9 +945,49 @@ if (!is.null(full_models$brt)) {
     Importance = brt_imp$rel.inf,
     Algorithm = "BRT"
   )
+} else {
+  brt_imp_df <- data.frame(Variable = character(), Importance = numeric(),
+                            Algorithm = character())
 }
 
-var_imp_all <- bind_rows(rf_imp_df, brt_imp_df)
+# --- MaxEnt: variance of marginal response curves ---
+# Measure how much each variable drives predictions when varied across its range
+occ_med_me <- apply(all_x[all_y == 1, ], 2, median, na.rm = TRUE)
+me_var <- sapply(pred_cols, function(v) {
+  vr <- seq(min(all_x[[v]], na.rm = TRUE), max(all_x[[v]], na.rm = TRUE),
+            length.out = 100)
+  pd <- as.data.frame(matrix(rep(occ_med_me, each = 100), nrow = 100,
+                              dimnames = list(NULL, pred_cols)))
+  pd[[v]] <- vr
+  var(predict(full_models$maxent, pd, type = "cloglog"), na.rm = TRUE)
+})
+me_imp_df <- data.frame(
+  Variable = pred_cols,
+  Importance = me_var / max(me_var) * 100,
+  Algorithm = "MaxEnt"
+)
+
+# --- GAM: chi-square statistic for each smooth term ---
+gam_smry <- summary(full_models$gam)
+gam_chi <- gam_smry$chi.sq
+gam_imp_df <- data.frame(
+  Variable = sub("^s\\(([^,)]+).*", "\\1", names(gam_chi)),
+  Importance = as.numeric(gam_chi) / max(as.numeric(gam_chi)) * 100,
+  Algorithm = "GAM"
+)
+
+# --- GLM: max |z-value| per variable (poly terms grouped back to variable name) ---
+glm_coefs <- summary(full_models$glm)$coefficients
+glm_coefs <- glm_coefs[rownames(glm_coefs) != "(Intercept)", , drop = FALSE]
+var_names_glm <- sub("^poly\\(([^,]+),.*", "\\1", rownames(glm_coefs))
+glm_z <- tapply(abs(glm_coefs[, "z value"]), var_names_glm, max)
+glm_imp_df <- data.frame(
+  Variable = names(glm_z),
+  Importance = as.numeric(glm_z) / max(as.numeric(glm_z)) * 100,
+  Algorithm = "GLM"
+)
+
+var_imp_all <- bind_rows(rf_imp_df, brt_imp_df, me_imp_df, gam_imp_df, glm_imp_df)
 
 p_varimp <- ggplot(var_imp_all, aes(x = reorder(Variable, Importance),
                                      y = Importance, fill = Algorithm)) +
@@ -949,7 +1002,7 @@ p_varimp <- ggplot(var_imp_all, aes(x = reorder(Variable, Importance),
 print(p_varimp)
 
 ggsave(file.path(figures_dir, "02_variable_importance.png"), p_varimp,
-       width = 10, height = 6, dpi = 300)
+       width = 10, height = 8, dpi = 300)
 ```
 
 ## 8.2 Response Curves
@@ -962,6 +1015,8 @@ ggsave(file.path(figures_dir, "02_variable_importance.png"), p_varimp,
 # which are dominated by background in unsuitable areas)
 occ_x <- all_x[all_y == 1, ]
 occ_medians <- apply(occ_x, 2, median, na.rm = TRUE)
+
+occ_subset <- occ_env_vals[occ_env_vals[["presence"]] == 1, ]
 
 response_plots <- list()
 
@@ -978,28 +1033,44 @@ for (var in pred_cols) {
   )
   pred_data[[var]] <- var_range
 
-  gam_response <- predict(full_models$gam, pred_data, type = "response")
+  # Collect predictions from all models
+  resp_list <- list(
+    MaxEnt = as.numeric(predict(full_models$maxent, pred_data, type = "cloglog")),
+    RF     = predict(full_models$rf, pred_data, type = "prob")[, "1"],
+    GAM    = as.numeric(predict(full_models$gam, pred_data, type = "response")),
+    GLM    = as.numeric(predict(full_models$glm, pred_data, type = "response"))
+  )
+  if (!is.null(full_models$brt)) {
+    resp_list$BRT <- predict(full_models$brt, pred_data,
+                             n.trees = full_models$brt$gbm.call$best.trees,
+                             type = "response")
+  }
 
-  response_df <- data.frame(x = var_range, y = gam_response)
+  response_df <- bind_rows(lapply(names(resp_list), function(nm) {
+    data.frame(x = var_range, y = as.numeric(resp_list[[nm]]), Algorithm = nm)
+  }))
 
-  occ_subset <- occ_env_vals[occ_env_vals[["presence"]] == 1, ]
   occ_range <- range(occ_subset[[var]], na.rm = TRUE)
 
-  response_plots[[var]] <- ggplot(response_df, aes(x = x, y = y)) +
-    geom_line(colour = "darkblue", linewidth = 1) +
-    geom_vline(xintercept = occ_range, linetype = "dashed", colour = "red",
-               alpha = 0.5) +
+  response_plots[[var]] <- ggplot(response_df, aes(x = x, y = y,
+                                                    colour = Algorithm)) +
+    geom_line(linewidth = 0.8) +
+    geom_vline(xintercept = occ_range, linetype = "dashed", colour = "grey40",
+               alpha = 0.7) +
     labs(title = var, x = var, y = "Predicted suitability") +
     ylim(0, 1) +
+    scale_colour_brewer(palette = "Set2") +
     theme_minimal() +
-    theme(plot.title = element_text(size = 10))
+    theme(plot.title = element_text(size = 10),
+          legend.position = "none")
 }
 
-p_response <- wrap_plots(response_plots, ncol = 3) +
+p_response <- wrap_plots(response_plots, ncol = 3, guides = "collect") +
   plot_annotation(
-    title = "GAM response curves",
-    subtitle = "Red dashed lines = observed range at occurrence points"
-  )
+    title = "Response curves across SDM algorithms",
+    subtitle = "Grey dashed lines = observed range at occurrence points"
+  ) &
+  theme(legend.position = "bottom")
 
 print(p_response)
 
@@ -1060,23 +1131,32 @@ pred_glm <- fill_raster(env_model, env_df$cell, glm_pred_vals, "glm")
 cat("Individual model predictions generated.\n")
 ```
 
-## 9.1 AUC-Weighted Ensemble
+## 9.1 Boyce-Weighted Ensemble
+
+GAM is excluded due to low and highly variable Boyce index across spatial CV folds
+(mean = 0.610, SD = 0.529), indicating unstable calibration. Remaining models are
+weighted proportionally to their mean Boyce index from spatial cross-validation.
 
 ```{r ensemble-weights}
-weights <- cv_summary$AUC_mean
-names(weights) <- algorithms
+# GAM excluded: lowest Boyce index (0.610) with highest fold-to-fold variance (SD = 0.529)
+boyce_scores <- cv_summary$Boyce_mean
+names(boyce_scores) <- algorithms
 
-weights <- weights / sum(weights, na.rm = TRUE)
-weights[is.na(weights)] <- 0
+# Zero out GAM and any negative/NA scores before normalising
+boyce_scores["gam"] <- 0
+boyce_scores[is.na(boyce_scores) | boyce_scores < 0] <- 0
 
-cat("Ensemble weights (proportional to CV AUC):\n")
+weights <- boyce_scores / sum(boyce_scores, na.rm = TRUE)
+
+cat("Ensemble weights (proportional to CV Boyce index, GAM excluded):\n")
 for (i in seq_along(algo_names)) {
-  cat(sprintf("  %s: %.3f (AUC = %.3f)\n",
-              algo_names[i], weights[i], cv_summary$AUC_mean[i]))
+  cat(sprintf("  %s: %.3f (Boyce = %.3f)\n",
+              algo_names[i], weights[i], cv_summary$Boyce_mean[i]))
 }
 
-pred_list <- list(maxent = pred_maxent, rf = pred_rf, gam = pred_gam, glm = pred_glm)
-weight_list <- weights[c("maxent", "rf", "gam", "glm")]
+# Build prediction list without GAM
+pred_list <- list(maxent = pred_maxent, rf = pred_rf, glm = pred_glm)
+weight_list <- weights[c("maxent", "rf", "glm")]
 
 if (!is.null(pred_brt)) {
   pred_list$brt <- pred_brt
@@ -1137,27 +1217,74 @@ names(ensemble_df) <- c("x", "y", "suitability")
 p_ensemble <- ggplot() +
   geom_raster(data = ensemble_df, aes(x = x, y = y, fill = suitability)) +
   geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
-  geom_point(data = occ_thinned, aes(x = lon, y = lat),
-             colour = "red", size = 0.8, alpha = 0.5, shape = 16) +
-  scale_fill_viridis(option = "magma", direction = -1,
-                     name = "Habitat\nSuitability",
-                     limits = c(0, 1)) +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  geom_sf(data = aus_states, fill = NA, colour = "grey60", linewidth = 0.3) +
+  # geom_point(
+  #   data = occ_thinned,
+  #   aes(x = lon, y = lat),
+  #   colour = "red",
+  #   size = 0.8,
+  #   alpha = 0.5,
+  #   shape = 16
+  # ) +
+  scale_fill_gradientn(
+    colours = c("white", magma(256, direction = -1)),
+    limits = c(0, 1),
+    name = "Habitat\nSuitability"
+  ) +
+  coord_sf(xlim = c(141, 155), ylim = c(-44 -10)) +
   labs(
-    title = expression("Ensemble habitat suitability for" ~ italic("Ixodes holocyclus")),
-    subtitle = "AUC-weighted mean of MaxEnt, RF, BRT, GAM, GLM",
-    x = "Longitude", y = "Latitude"
+    title = expression(
+      "Ensemble habitat suitability for" ~ italic("Ixodes holocyclus")
+    ),
+    subtitle = "Boyce-weighted mean of MaxEnt, RF, BRT, GLM (GAM excluded)",
+    x = "Longitude",
+    y = "Latitude"
   ) +
   theme_minimal() +
   theme(legend.position = "right")
 
 print(p_ensemble)
 
-ggsave(file.path(figures_dir, "04_ensemble_suitability.png"), p_ensemble,
-       width = 10, height = 10, dpi = 300)
+ggsave(
+  file.path(figures_dir, "04_ensemble_suitability.png"),
+  p_ensemble,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
 ```
 
-## 10.2 Binary Presence Map
+## 10.2 Interactive Ensemble Map
+
+```{r leaflet-ensemble-map}
+pal_leaf <- colorNumeric(
+  palette = c("white", magma(256, direction = -1)),
+  domain  = c(0, 1),
+  na.color = "transparent"
+)
+
+# Convert terra SpatRaster to RasterLayer for leaflet compatibility
+ens_rl <- raster::raster(ensemble_mean)
+
+leaflet() %>%
+  addTiles(group = "OpenStreetMap") %>%
+  addRasterImage(ens_rl, colors = pal_leaf, opacity = 0.8,
+                 group = "Habitat Suitability") %>%
+  addLegend(
+    pal      = pal_leaf,
+    values   = c(0, 1),
+    title    = "Habitat<br>Suitability",
+    position = "bottomright",
+    opacity  = 0.9
+  ) %>%
+  addLayersControl(
+    baseGroups   = "OpenStreetMap",
+    overlayGroups = "Habitat Suitability",
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
+
+## 10.3 Binary Presence Map
 
 ```{r map-binary}
 #| fig-width: 10
@@ -1177,7 +1304,7 @@ p_binary <- ggplot() +
              colour = "red", size = 0.8, alpha = 0.8, shape = 16) +
   scale_fill_manual(values = c("Unsuitable" = "grey60", "Suitable" = "lightblue"),
                     name = "") +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  coord_sf(xlim = c(141, 155), ylim = c(-44, -10)) +
   labs(
     title = expression("Predicted distribution of" ~ italic("Ixodes holocyclus")),
     subtitle = paste0("TSS-optimised threshold = ", round(tss_result$threshold, 3),
@@ -1193,7 +1320,7 @@ ggsave(file.path(figures_dir, "05_binary_distribution.png"), p_binary,
        width = 10, height = 10, dpi = 300)
 ```
 
-## 10.3 Prediction Uncertainty Map
+## 10.4 Prediction Uncertainty Map
 
 ```{r map-uncertainty}
 #| fig-width: 10
@@ -1206,8 +1333,13 @@ p_uncert <- ggplot() +
   geom_raster(data = uncert_df,
               aes(x = x, y = y, fill = uncertainty)) +
   geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
-  scale_fill_viridis(option = "plasma", name = "SD across\nmodels") +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  scale_fill_gradientn(
+    colours = c("white", magma(256, direction = -1)),
+    limits = c(0, 1),
+    name = "SD across\nmodels"
+  ) +
+  #scale_fill_viridis(option = "plasma", name = "SD across\nmodels") +
+  coord_sf(xlim = c(141, 155), ylim = c(-44, -10)) +
   labs(
     title = "Prediction uncertainty",
     subtitle = "Standard deviation across 5 SDM algorithms",
@@ -1222,7 +1354,7 @@ ggsave(file.path(figures_dir, "06_prediction_uncertainty.png"), p_uncert,
        width = 10, height = 10, dpi = 300)
 ```
 
-## 10.4 Individual Model Comparison
+## 10.5 Individual Model Comparison
 
 ```{r map-individual-models}
 #| fig-width: 14
@@ -1248,28 +1380,99 @@ if (!is.null(pred_brt)) {
 all_pred_df <- bind_rows(pred_dfs)
 
 p_compare <- ggplot() +
-  geom_raster(data = all_pred_df,
-              aes(x = x, y = y, fill = suitability)) +
+  geom_raster(data = all_pred_df, aes(x = x, y = y, fill = suitability)) +
   geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.2) +
-  scale_fill_viridis(option = "magma", direction = -1,
-                     name = "Suitability", limits = c(0, 1)) +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+  scale_fill_gradientn(
+    colours = c("white", magma(256, direction = -1)),
+    limits = c(0, 1),
+    name = "Habitat\nSuitability"
+  ) +
+  # scale_fill_viridis(
+  #   option = "magma",
+  #   direction = -1,
+  #   name = "Suitability",
+  #   limits = c(0, 1)
+  # ) +
+  coord_sf(xlim = c(140, 155), ylim = c(-44, -10)) +
   facet_wrap(~model, ncol = 3) +
   labs(
-    title = expression("Individual model predictions for" ~ italic("Ixodes holocyclus")),
-    x = "Longitude", y = "Latitude"
+    title = expression(
+      "Individual model predictions for" ~ italic("Ixodes holocyclus")
+    ),
+    x = "Longitude",
+    y = "Latitude"
   ) +
   theme_minimal() +
-  theme(legend.position = "bottom",
-        strip.text = element_text(size = 12, face = "bold"))
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12, face = "bold")
+  )
 
 print(p_compare)
 
-ggsave(file.path(figures_dir, "07_model_comparison.png"), p_compare,
-       width = 14, height = 10, dpi = 300)
+ggsave(
+  file.path(figures_dir, "07_model_comparison.png"),
+  p_compare,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
 ```
 
-## 10.5 Save GeoTIFF Outputs
+## 10.6 MaxEnt Model
+
+```{r map-maxent}
+#| fig-width: 10
+#| fig-height: 10
+
+maxent_df <- as.data.frame(pred_maxent, xy = TRUE, na.rm = TRUE)
+names(maxent_df) <- c("x", "y", "suitability")
+
+p_maxent <- ggplot() +
+  geom_raster(data = maxent_df, aes(x = x, y = y, fill = suitability)) +
+  geom_sf(data = aus, fill = NA, colour = "black", linewidth = 0.3) +
+  geom_sf(data = aus_states, fill = NA, colour = "grey60", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colours  = c("white", magma(256, direction = -1)),
+    limits   = c(0, 1),
+    name     = "Habitat\nSuitability"
+  ) +
+  coord_sf(xlim = c(141, 155), ylim = c(-44, -10)) +
+  labs(
+    title    = expression("MaxEnt habitat suitability for" ~ italic("Ixodes holocyclus")),
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p_maxent)
+
+ggsave(file.path(figures_dir, "08_maxent_suitability.png"), p_maxent,
+       width = 10, height = 10, dpi = 300)
+```
+
+```{r leaflet-maxent-map}
+maxent_rl <- raster::raster(pred_maxent)
+
+leaflet() %>%
+  addTiles(group = "OpenStreetMap") %>%
+  addRasterImage(maxent_rl, colors = pal_leaf, opacity = 0.8,
+                 group = "MaxEnt Suitability") %>%
+  addLegend(
+    pal      = pal_leaf,
+    values   = c(0, 1),
+    title    = "MaxEnt<br>Suitability",
+    position = "bottomright",
+    opacity  = 0.9
+  ) %>%
+  addLayersControl(
+    baseGroups    = "OpenStreetMap",
+    overlayGroups = "MaxEnt Suitability",
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
+
+## 10.7 Save GeoTIFF Outputs
 
 ```{r save-outputs}
 sdm_output_dir <- file.path(output_dir, "sdm_results")
