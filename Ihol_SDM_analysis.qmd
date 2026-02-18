@@ -72,6 +72,7 @@ study_extent <- ext(140, 155, -40, -10)
 
 # --- Australia boundary for maps ---
 aus <- ne_countries(country = "Australia", scale = "medium", returnclass = "sf")
+aus_states <- ne_states(country = "Australia", returnclass = "sf")
 ```
 
 # 2. Occurrence Data Preparation
@@ -85,7 +86,7 @@ cat("Raw GBIF records:", nrow(gbif_raw), "\n")
 
 # Clean occurrence data
 occ_clean <- gbif_raw %>%
-  select(
+  dplyr::select(
     id = ID, species = scientificName,
     lat = decimalLatitude, lon = decimalLongitude,
     year, month, day, state = stateProvince
@@ -135,18 +136,18 @@ if (file.exists(thinned_file)) {
 ## 2.2 Map Occurrence Points
 
 ```{r map-occurrences}
-#| fig-width: 8
-#| fig-height: 8
-
 p_occ <- ggplot() +
   geom_sf(data = aus, fill = "grey90", colour = "grey40") +
+  geom_sf(data = aus_states, fill = NA, colour = "grey60", linewidth = 0.3) +
   geom_point(data = occ_clean,
              aes(x = lon, y = lat),
-             colour = "grey60", size = 1, alpha = 0.5) +
+             shape = 21, fill = "grey60", colour = "black",
+             stroke = 0.3, size = 1, alpha = 1) +
   geom_point(data = occ_thinned,
              aes(x = lon, y = lat),
-             colour = "red", size = 1.5, alpha = 0.7) +
-  coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
+             shape = 21, fill = "red", colour = "black",
+             stroke = 0.3, size = 1.5, alpha = 1) +
+  coord_sf(xlim = c(141, 155), ylim = c(-40, -10)) +
   labs(
     title = expression(italic("Ixodes holocyclus") ~ "occurrence records"),
     subtitle = paste0("Grey: all cleaned (n=", nrow(occ_clean),
@@ -158,7 +159,7 @@ p_occ <- ggplot() +
 print(p_occ)
 
 ggsave(file.path(figures_dir, "01_occurrence_map.png"), p_occ,
-       width = 8, height = 8, dpi = 300)
+       width = 8, height = 10, dpi = 300)
 ```
 
 # 3. Environmental Data Preparation
@@ -187,16 +188,26 @@ envirem_vars <- rast(envirem_files)
 names(envirem_vars) <- c("pet_annual", "aridity_idx", "cmi_idx")
 
 # --- CHELSA VPD ---
-chelsa_path <- file.path(data_dir, "climate_data", "climate", "chelsa")
-vpd_files <- file.path(chelsa_path,
-  paste0("CHELSA_vpd_", sprintf("%02d", 1:12), "_1981-2010_V.2.1.tif"))
-vpd_stack <- rast(vpd_files)
-vpd_stack <- vpd_stack / 100  # CHELSA VPD: Pa * 100 -> hPa
-vpd_annual <- mean(vpd_stack, na.rm = TRUE)
-names(vpd_annual) <- "vpd_annual"
+vpd_cache <- file.path(processed_dir, "vpd_agg_2.5arcmin.tif")
 
-# Aggregate CHELSA from 30 arcsec to 2.5 arcmin (factor of 5)
-vpd_agg <- aggregate(vpd_annual, fact = 5, fun = "mean", na.rm = TRUE)
+if (file.exists(vpd_cache)) {
+  vpd_agg <- rast(vpd_cache)
+  cat("Loaded cached VPD raster from disk\n")
+} else {
+  chelsa_path <- file.path(data_dir, "climate_data", "climate", "chelsa")
+  vpd_files <- file.path(chelsa_path,
+    paste0("CHELSA_vpd_", sprintf("%02d", 1:12), "_1981-2010_V.2.1.tif"))
+  vpd_stack <- rast(vpd_files)
+  vpd_stack <- vpd_stack / 100  # CHELSA VPD: Pa * 100 -> hPa
+  vpd_annual <- mean(vpd_stack, na.rm = TRUE)
+  names(vpd_annual) <- "vpd_annual"
+
+  # Aggregate CHELSA from 30 arcsec to 2.5 arcmin (factor of 5)
+  vpd_agg <- aggregate(vpd_annual, fact = 5, fun = "mean", na.rm = TRUE)
+
+  writeRaster(vpd_agg, vpd_cache)
+  cat("Processed and cached VPD raster to disk\n")
+}
 
 cat("Loaded:", nlyr(bioclim_all), "WorldClim +",
     nlyr(envirem_vars), "ENVIREM +", "1 CHELSA VPD layers\n")
@@ -374,17 +385,73 @@ env_model <- env_all[[final_vars]]
 
 # 5. Background Point Generation
 
-```{r background-points}
+```{r accessible-area}
 n_bg <- 10000
+# Convert occurrence SpatVector to sf
+occ_sf <- st_as_sf(occ_pts)
 
-land_mask <- !is.na(env_model[[1]])
+# Buffer all occurrence points by 500 km to define accessible area (M)
+occ_combined <- st_union(occ_sf)
+occ_projected <- st_transform(occ_combined, crs = "+proj=moll")
+buffer_500km <- st_buffer(occ_projected, dist = 500000)  # 500 km in metres
+buffer_wgs84 <- st_transform(buffer_500km, crs = 4326)
 
-bg_cells <- spatSample(land_mask, size = n_bg, method = "random",
-                       cells = TRUE, na.rm = TRUE)
+# Make the buffer geometry valid before intersection
+buffer_wgs84 <- st_make_valid(buffer_wgs84)
 
-bg_coords <- xyFromCell(env_model, bg_cells$cell)
-bg_df <- as.data.frame(bg_coords)
-names(bg_df) <- c("lon", "lat")
+# Get global land polygons and intersect with buffer to exclude ocean
+world_land <- ne_countries(scale = "medium", returnclass = "sf") |>
+  st_union()  # Dissolve into a single polygon
+
+world_land <- st_make_valid(world_land)
+
+# Use st_intersection with prepared geometries
+accessible_area <- st_intersection(buffer_wgs84, world_land)
+
+# Calculate area of the accessible region
+area_km2 <- as.numeric(st_area(accessible_area)) / 1e6
+```
+
+```{r plot-accessible-area}
+world_map <- ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot() +
+  geom_sf(data = world_map, fill = "grey95", colour = "grey70", linewidth = 0.2) +
+  geom_sf(data = accessible_area, fill = "lightblue", alpha = 0.3,
+          colour = "blue", linewidth = 0.5) +
+  geom_sf(data = occ_sf, colour = "red", size = 0.8, alpha = 0.6) +
+  coord_sf(xlim = c(130, 155), ylim = c(-40, -10)) +
+  labs(
+    title = expression("Accessible area (M) for" ~ italic("Ixodes holocyclus")),
+    subtitle = sprintf("500 km buffer around occurrences (land only) — %.0f km²", area_km2)
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(figures_dir, "04_accessible_area_map.png"),
+       width = 12, height = 6, dpi = 300)
+```
+
+```{r Mask-environmental-rasters-to-accessible-area}
+# Convert accessible area sf to a terra SpatVector for masking
+accessible_vect <- vect(accessible_area)
+
+# Crop and mask the environmental rasters to the accessible area
+env_M <- crop(env_model, accessible_vect)
+env_M <- mask(env_M, accessible_vect)
+
+# Check how many valid (non-NA) cells exist within M
+n_cells <- global(!is.na(env_M[[1]]), sum)[[1]]
+sprintf("Valid raster cells within accessible area: %.0f", n_cells)
+```
+
+```{r background-points}
+# Sample candidate background points from within the accessible area (env_M).
+# Sampling directly from env_M ensures na.rm=TRUE filters to non-NA cells only,
+# i.e. cells that fall within the 500 km buffered zone.
+# Oversample to allow for the 5 km exclusion buffer around occurrences.
+bg_sample <- spatSample(env_M, size = n_bg * 2, method = "random",
+                        na.rm = TRUE, xy = TRUE)
+bg_df <- data.frame(lon = bg_sample$x, lat = bg_sample$y)
 
 # Remove background points within 5 km of any occurrence point
 occ_sf_pts <- st_as_sf(occ_thinned, coords = c("lon", "lat"), crs = 4326)
@@ -394,7 +461,7 @@ min_dist <- st_distance(bg_sf_pts, occ_sf_pts)
 min_dist_km <- apply(min_dist, 1, min) / 1000
 
 bg_df <- bg_df[min_dist_km > 5, ]
-cat("Background points after 5 km buffer:", nrow(bg_df), "\n")
+cat("Background points after 5 km exclusion buffer:", nrow(bg_df), "\n")
 
 if (nrow(bg_df) > n_bg) {
   bg_df <- bg_df[sample(nrow(bg_df), n_bg), ]
@@ -435,25 +502,56 @@ cat("Modelling dataset: ", sum(model_data$presence == 1), "presences +",
 ## 5.2 Map Presence and Background Points
 
 ```{r map-points}
-#| fig-width: 8
-#| fig-height: 8
-
 p_points <- ggplot() +
   geom_sf(data = aus, fill = "grey90", colour = "grey40") +
-  geom_point(data = model_data %>% filter(presence == 0),
-             aes(x = lon, y = lat),
-             colour = "steelblue", size = 0.3, alpha = 0.2) +
-  geom_point(data = model_data %>% filter(presence == 1),
-             aes(x = lon, y = lat),
-             colour = "red", size = 1.5, alpha = 0.7) +
+  geom_point(
+    data = model_data %>% filter(presence == 0),
+    aes(x = lon, y = lat),
+    colour = "steelblue",
+    fill = "steelblue",
+    size = 0.3,
+    alpha = 0.5,
+    shape = 21
+  ) +
+  geom_point(
+    data = model_data %>% filter(presence == 1),
+    aes(x = lon, y = lat),
+    shape = 21,
+    fill = "red",
+    colour = "black",
+    stroke = 0.3,
+    size = 1.5,
+    alpha = 1
+  ) +
+  geom_sf(
+    data = accessible_area,
+    fill = "lightblue",
+    alpha = 0.3,
+    colour = NULL,
+    linewidth = 0.2
+  ) +
   coord_sf(xlim = c(140, 155), ylim = c(-40, -10)) +
   labs(
     title = "Modelling dataset",
-    subtitle = paste0("Red: presences (n=", sum(model_data$presence == 1),
-                      "), Blue: background (n=", sum(model_data$presence == 0), ")"),
-    x = "Longitude", y = "Latitude"
+    subtitle = paste0(
+      "Red: presences (n=",
+      sum(model_data$presence == 1),
+      "), Blue: background (n=",
+      sum(model_data$presence == 0),
+      ")"
+    ),
+    x = "Longitude",
+    y = "Latitude"
   ) +
   theme_minimal()
+
+ggsave(
+  file.path(figures_dir, "02_model_bg_points.png"),
+  p_points,
+  height = 8,
+  width = 8,
+  dpi = 300
+)
 
 print(p_points)
 ```
